@@ -1,0 +1,135 @@
+CWD=/home/zsh/UAV_video_repair/third_party/SeedVR
+/home/zsh/UAV_video_repair/third_party/SeedVR
+/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/rotary_embedding_torch/rotary_embedding_torch.py:35: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @autocast(enabled = False)
+/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/rotary_embedding_torch/rotary_embedding_torch.py:253: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  @autocast(enabled = False)
+2026-05-16 13:55:28,983 [MainThread][common.decorators][INFO] Entering configure_dit_model
+/home/zsh/UAV_video_repair/third_party/SeedVR/projects/video_diffusion_sr/infer.py:89: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(checkpoint, map_location="cpu", mmap=True)
+Loading pretrained ckpt from ./ckpts/seedvr2_ema_3b.pth
+Loading info: <All keys matched successfully>
+DiT trainable parameters: 3,391,475,776
+2026-05-16 13:56:05,388 [MainThread][common.decorators][INFO] Completed configure_dit_model in 34.632 seconds.
+2026-05-16 13:56:05,388 [MainThread][common.decorators][INFO] Entering configure_vae_model
+/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/diffusers/models/transformers/transformer_2d.py:34: FutureWarning: `Transformer2DModelOutput` is deprecated and will be removed in version 1.0.0. Importing `Transformer2DModelOutput` from `diffusers.models.transformer_2d` is deprecated and this will be removed in a future version. Please use `from diffusers.models.modeling_outputs import Transformer2DModelOutput`, instead.
+  deprecate("Transformer2DModelOutput", "1.0.0", deprecation_message)
+slicing_up_num: 0
+/home/zsh/UAV_video_repair/third_party/SeedVR/projects/video_diffusion_sr/infer.py:112: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state = torch.load(
+2026-05-16 13:56:21,051 [MainThread][common.decorators][INFO] Completed configure_vae_model in 15.663 seconds.
+Total prompts to be generated: 1
+  0%|          | 0/1 [00:00<?, ?it/s]/home/zsh/UAV_video_repair/third_party/SeedVR/projects/inference_seedvr2_3b.py:169: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  text_pos_embeds = torch.load('pos_emb.pt')
+/home/zsh/UAV_video_repair/third_party/SeedVR/projects/inference_seedvr2_3b.py:170: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  text_neg_embeds = torch.load('neg_emb.pt')
+100%|██████████| 1/1 [00:00<00:00, 814.27it/s]
+0it [00:00, ?it/s]/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torchvision/io/video.py:161: UserWarning: The pts_unit 'pts' gives wrong results. Please use pts_unit 'sec'.
+  warnings.warn("The pts_unit 'pts' gives wrong results. Please use pts_unit 'sec'.")
+Read video size: torch.Size([84, 3, 720, 960])
+Encoding videos: [torch.Size([3, 85, 720, 960])]
+Generating with noise shape: torch.Size([22, 90, 120, 16]).
+Timestep shifting from 0.0 to tensor([0.], device='cuda:0').
+
+EulerSampler:   0%|          | 0/1 [00:00<?, ?it/s][A/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/apex/_autocast_utils.py:26: FutureWarning: `torch.cuda.amp.autocast_mode._cast(value, dtype)` is deprecated. Please use `torch.amp.autocast_mode._cast(value, 'cuda', dtype)` instead.
+  return torch.cuda.amp.autocast_mode._cast(args, torch.get_autocast_gpu_dtype())
+/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/apex/normalization/fused_layer_norm.py:220: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=False):
+/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/apex/normalization/fused_layer_norm.py:214: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=False):
+0it [00:31, ?it/s]
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/common/cache.py", line 32, in __call__
+[rank0]:     result = self.cache[key]
+[rank0]: KeyError: '720pwin_by_size_bysize_(4, 3, 3)_sd3.mmrope_freqs_3d'
+
+[rank0]: During handling of the above exception, another exception occurred:
+
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/projects/inference_seedvr2_3b.py", line 337, in <module>
+[rank0]:     generation_loop(runner, **vars(args))
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/projects/inference_seedvr2_3b.py", line 284, in generation_loop
+[rank0]:     samples = generation_step(runner, text_embeds, cond_latents=cond_latents)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/projects/inference_seedvr2_3b.py", line 121, in generation_step
+[rank0]:     video_tensors = runner.inference(
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+[rank0]:     return func(*args, **kwargs)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/projects/video_diffusion_sr/infer.py", line 306, in inference
+[rank0]:     latents = self.sampler.sample(
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/common/diffusion/samplers/euler.py", line 54, in sample
+[rank0]:     pred = f(SamplerModelArgs(x, t, i))
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/projects/video_diffusion_sr/infer.py", line 308, in <lambda>
+[rank0]:     f=lambda args: classifier_free_guidance_dispatcher(
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/common/diffusion/utils.py", line 76, in classifier_free_guidance_dispatcher
+[rank0]:     return pos()
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/projects/video_diffusion_sr/infer.py", line 309, in <lambda>
+[rank0]:     pos=lambda: self.dit(
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/nadit.py", line 220, in forward
+[rank0]:     vid, txt, vid_shape, txt_shape = gradient_checkpointing(
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/nadit.py", line 32, in gradient_checkpointing
+[rank0]:     return module(*args, **kwargs)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/nablocks/mmsr_block.py", line 109, in forward
+[rank0]:     vid_attn, txt_attn = self.attn(vid_attn, txt_attn, vid_shape, txt_shape, cache)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/nablocks/attention/mmattn.py", line 234, in forward
+[rank0]:     vid_q, vid_k, txt_q, txt_k = self.rope(
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/rope.py", line 107, in forward
+[rank0]:     vid_freqs, txt_freqs = cache(
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/common/cache.py", line 34, in __call__
+[rank0]:     result = fn()
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/rope.py", line 109, in <lambda>
+[rank0]:     lambda: self.get_freqs(vid_shape, txt_shape),
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/rope.py", line 134, in get_freqs
+[rank0]:     vid_freqs = self.get_axial_freqs(1024, 128, 128)
+[rank0]:   File "/home/zsh/UAV_video_repair/third_party/SeedVR/models/dit_v2/rope.py", line 46, in get_axial_freqs
+[rank0]:     return self.rope.get_axial_freqs(*dims)
+[rank0]:   File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/rotary_embedding_torch/rotary_embedding_torch.py", line 251, in get_axial_freqs
+[rank0]:     return torch.cat(all_freqs, dim = -1)
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.88 GiB. GPU 0 has a total capacity of 79.15 GiB of which 7.30 GiB is free. Process 2916618 has 49.26 GiB memory in use. Process 836824 has 732.00 MiB memory in use. Including non-PyTorch memory, this process has 21.83 GiB memory in use. Of the allocated memory 19.88 GiB is allocated by PyTorch, and 1.13 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+EulerSampler:   0%|          | 0/1 [00:01<?, ?it/s]
+[rank0]:[W516 13:56:53.031841354 ProcessGroupNCCL.cpp:1168] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+E0516 13:56:54.549000 140422206600384 torch/distributed/elastic/multiprocessing/api.py:833] failed (exitcode: 1) local_rank: 0 (pid: 880498) of binary: /home/zsh/anaconda3/envs/seedvr/bin/python3.10
+Traceback (most recent call last):
+  File "/home/zsh/anaconda3/envs/seedvr/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+  File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 348, in wrapper
+    return f(*args, **kwargs)
+  File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 133, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/zsh/anaconda3/envs/seedvr/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 264, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+projects/inference_seedvr2_3b.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-05-16_13:56:54
+  host      : gulab-server-A8004
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 880498)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

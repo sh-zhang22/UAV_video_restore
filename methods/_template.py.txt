@@ -1,0 +1,39 @@
+# 方法适配器模板：复制此文件为 methods/<name>.py，<name> 即对外可见的 method 字符串。
+# 实际接入新方法时，请改成 .py 后缀；保留为 .txt 以避免被自动导入。
+
+"""<方法名> 适配器：基于 third_party/<project_name>/ 的推理代码。
+
+调用约定：Recover 主接口会以关键字方式传入下列参数。
+具体方法的额外可调参数通过 method_kwargs 透传，从 **kwargs 中取出。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Optional
+
+from methods._registry import register
+
+# 把 third_party 下的项目目录加入 sys.path，按需修改
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_THIRD_PARTY = os.path.normpath(os.path.join(_THIS_DIR, "..", "third_party", "<project_name>"))
+if _THIRD_PARTY not in sys.path:
+    sys.path.insert(0, _THIRD_PARTY)
+
+
+@register("<name>")
+def _run(
+    *,
+    video_path: str,
+    recovered_path: str,
+    ckpt_path: str,
+    device: Optional[str] = None,
+    **kwargs,
+) -> str:
+    # TODO: 1) 解码 MP4 -> 帧序列
+    # TODO: 2) 加载 ckpt_path 对应的模型，搬到 device
+    # TODO: 3) 逐 clip / 滑窗推理
+    # TODO: 4) 编码帧序列 -> recovered_path (MP4)
+    raise NotImplementedError
+    return recovered_path
