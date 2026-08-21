@@ -106,6 +106,11 @@ def _generation_step(runner, text_embeds_dict, cond_latents, cond_noise_scale: f
         videos = runner.inference(
             noises=noises, conditions=conditions, dit_offload=True, **text_embeds_dict
         )
+    return [
+        rearrange(v[:, None] if v.ndim == 3 else v, "c t h w -> t c h w") for v in videos
+    ]
+
+
 def _cut_videos(video, sp_size):
     t = video.size(1)
     if t == 1:
@@ -238,6 +243,14 @@ def main():
     )
 
     runner = _build_runner(args.variant, args.dit_ckpt, args.vae_ckpt, args.sp_size)
+    dev = torch.cuda.current_device()
+    after_load_alloc = torch.cuda.memory_allocated(dev) / 1024**3
+    after_load_reserved = torch.cuda.memory_reserved(dev) / 1024**3
+    print(
+        f"[GPU mem] after model load: allocated={after_load_alloc:.2f} GiB, "
+        f"reserved={after_load_reserved:.2f} GiB"
+    )
+    torch.cuda.reset_peak_memory_stats(dev)
     _run_one_video(
         runner,
         in_video=args.in_video,
@@ -251,6 +264,15 @@ def main():
         sp_size=args.sp_size,
         out_fps=args.out_fps,
         cond_noise_scale=cond_noise_scale,
+    )
+
+    dev = torch.cuda.current_device()
+    peak_alloc = torch.cuda.max_memory_allocated(dev) / 1024**3
+    peak_reserved = torch.cuda.max_memory_reserved(dev) / 1024**3
+    free, total = torch.cuda.mem_get_info(dev)
+    print(
+        f"[GPU mem] inference peak (since reset): allocated={peak_alloc:.2f} GiB, "
+        f"reserved={peak_reserved:.2f} GiB; current_free={free / 1024**3:.2f}/{total / 1024**3:.2f} GiB"
     )
 
 

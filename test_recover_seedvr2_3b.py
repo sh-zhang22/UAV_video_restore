@@ -14,7 +14,7 @@ out = Recover(
     recovered_path="test_recovered_seedvr2_3b.mp4",
     ckpt_path="third_party/SeedVR/ckpts/seedvr2_ema_3b.pth",
     method="seedvr2_3b",
-    device="cuda:3",
+    device="cuda:1",
     method_kwargs={"res_h": 720, "res_w": 960, "sp_size": 1, "seed": 666},
 )
 print(f"DONE: {out} in {time.time()-t0:.1f}s")
