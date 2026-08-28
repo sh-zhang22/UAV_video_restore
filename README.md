@@ -435,7 +435,137 @@ Recover(
 
 ---
 
-## 6. 直接复用 SeedVR 原推断脚本（不走 Recover）
+## 6. 蒸馏：SeedVR2-3B 层裁剪 + KD（32 → 20 层）
+
+用于给 SeedVR2-3B 再做一次瘦身：**DistilBERT-style 层裁剪 + KD**（前 10 mm-layer 全保 + 后 22
+层按 `linspace(10, 31, 10)` 均匀取 10 → 学生 20 层），教师、学生同构（都是 NaDiT），推理只需
+CLI 覆盖 `num_layers`、加载学生 ckpt 即可，无需新增 method。
+
+### 6.1 冒烟通路已跑通、暂无真实数据
+
+**当前状态**（截至提交本 README）：
+
+- ✅ 代码流水线搭好，`method="seedvr2_3b" + distill_mode=True` 触发蒸馏训练分支
+- ✅ 4 步冒烟全部通过：学生 sanity、蒸馏 3 步训练、学生推理、原 baseline 逐字节回归
+- ⏸  真实训练数据未到位；训练脚本仍在用假数据（test.mp4 + 随机 noise/timestep 重复 N 步）
+- ⏸  `λ_feat` 暂关（=0）：全 32/20 层 hook 全开会显存爆表；等真实数据到位后可用分块 backward 打开
+
+**4 步冒烟结果一览**（`--device cuda:1`，A800 单卡）：
+
+| Step | 场景 | 结果 |
+|---|---|---|
+| D1 | 学生构造 sanity（20 层 state_dict、config 派生） | 前 10 mm-layer 全保 + 后 10 层跨步映射，`load_state_dict` 无 missing/unexpected |
+| D2 | 蒸馏 3 步（λ_out=1, λ_feat=0, λ_diff=1） | loss 2.08→1.36→1.34，peak 71 GiB，`student.pth` 9.7 GB 落盘 |
+| D3 | 学生 20 层推理 | 端到端 82s（vs 教师 96s），输出 mp4 存在 |
+| D4 | 原 baseline `seedvr2_3b` 回归 | 输出与蒸馏改动前 **MD5 逐字节一致** |
+
+### 6.2 快速上手
+
+**训练**（冒烟 3 步，产出 `runs_distill/student.pth`）：
+
+```bash
+python train_seedvr2_3b_distill.py --train_steps 3 --lambda_feat 0
+```
+
+**学生推理**（20 层）：
+
+```bash
+python test_recover_seedvr2_3b_student.py
+# → test_recovered_seedvr2_3b_student.mp4
+```
+
+### 6.3 直接通过 Recover 调用
+
+**蒸馏训练**：
+
+```python
+Recover(
+    video_path     = "in.mp4",
+    recovered_path = "runs_distill/_placeholder.mp4",  # 训练不产出 mp4
+    ckpt_path      = "third_party/SeedVR/ckpts/seedvr2_ema_3b.pth",
+    method         = "seedvr2_3b",       # 走教师 variant，distill_mode 分派到蒸馏分支
+    device         = "cuda:1",
+    method_kwargs  = {
+        "distill_mode": True,
+        "student_num_layers": 20,
+        "save_dir": "runs_distill",
+        "student_save_path": "student.pth",
+        "train_steps": 3, "lr": 1e-5, "warmup_steps": 0,
+        "distill_lambda_out": 1.0, "distill_lambda_feat": 0.0, "distill_lambda_diff": 1.0,
+        "res_h": 720, "res_w": 960, "seed": 666,
+    },
+)
+```
+
+**学生推理**（不新增 method，复用 `seedvr2_3b`，通过 `student_num_layers` 派生 20 层 config）：
+
+```python
+Recover(
+    video_path     = "in.mp4",
+    recovered_path = "out.mp4",
+    ckpt_path      = "runs_distill/student.pth",       # 学生权重
+    method         = "seedvr2_3b",
+    device         = "cuda:1",
+    method_kwargs  = {
+        "student_num_layers": 20,
+        "vae_ckpt": "third_party/SeedVR/ckpts/ema_vae.pth",  # 学生 ckpt 目录无 VAE，显式指定
+        "res_h": 720, "res_w": 960, "seed": 666,
+    },
+)
+```
+
+### 6.4 蒸馏特有的 method_kwargs
+
+在 §2.2 通用参数之上追加：
+
+| key                    | 含义                                                             | 默认值 |
+|------------------------|------------------------------------------------------------------|--------|
+| `distill_mode`         | True → 走蒸馏训练分支，不产出 mp4                                 | False  |
+| `student_num_layers`   | 学生层数；训练=20（层映射固定），推理=20                          | None   |
+| `student_save_path`    | 学生权重文件名（相对 `save_dir` 或绝对路径）                       | `student.pth` |
+| `save_dir`             | 训练权重保存目录                                                  | `./runs_distill` |
+| `train_steps`          | 训练步数                                                          | 3      |
+| `lr`                   | AdamW 学习率                                                      | 1e-5   |
+| `warmup_steps`         | LR warmup 步数（0=关）                                            | 0      |
+| `distill_lambda_out`   | Loss 权重：`MSE(z_S, z_T)` output 蒸馏                            | 1.0    |
+| `distill_lambda_feat`  | Loss 权重：Σ `1 - cos(h_S[j], h_T[map[j]])` feature 对齐          | 0.5    |
+| `distill_lambda_diff`  | Loss 权重：`MSE(z_S, v)` 原扩散目标                               | 1.0    |
+
+### 6.5 技术方案要点
+
+- **层映射**：`TEACHER_LAYER_MAP = [0..9, 10,12,15,17,19,22,24,26,29,31]`。前 10 mm-layer
+  (`shared_weights=False`，含 `.vid`/`.txt`) 全保；后 22 shared-weights 层里均匀取 10 端点包含。
+  同构简化了推理路径：不新增 method，`_build_runner` 里按 `override_num_layers` 派生 20 层 config。
+- **学生权重初始化**：`build_student_state_dict_from_teacher` 用 regex `^blocks\.(\d+)\.` 抽子集
+  + 重命名（`blocks.10.*` → `blocks.10.*`, `blocks.12.*` → `blocks.11.*`, ...），非 `blocks.*`
+  的 key（`vid_in / vid_out / emb_in / vid_out_norm / vid_out_ada`）原样保留。
+- **Rope 全局共享（关键显存优化）**：`RotaryEmbedding.get_axial_freqs(1024,128,128)` 会 build
+  ~8 GiB 的 freqs 表并 `@lru_cache`（per-instance）。教师 32 层 + 学生 20 层若各自缓存 →
+  ~416 GiB 显存爆表。方案是让所有 52 层的 `attn.rope` **共享同一个实例**（教师 blocks[0].attn.rope），
+  freqs 是 `register_buffer` 且各层数值一致（rope_dim/theta 同 config，无 learnable），共享数值等价。
+- **教师 bf16**：教师 3.4B fp32 ~12.6 GiB → bf16 ~6.3 GiB 省一半。共享 rope 单独保 fp32
+  （位置编码累积需要精度），`apply_rotary_emb` 内 `q.float()` 保证 rope 计算全 fp32 稳定。
+- **`λ_feat=0` 时不装 hooks**：`BlockOutputCapture` 会保留全部 block 的中间激活 → 反向图翻倍。
+  冒烟阶段 `λ_feat=0` 走 output+diffusion 双损失；真实数据到位后再考虑分块 backward 打开 feature loss。
+- **OmegaConf `${eval:...}` 副作用规避**：deepcopy 后 `${eval:...}` 已解析为原生 list；派生
+  student config 时显式覆盖 `num_layers/window/block_type/window_method` 为长度=20 的显式 list，
+  绕过 `num_layers` 变化触发的 eval 重解析。
+- **不新增推理 method**：学生推理复用 `seedvr2_3b` variant，通过 CLI `--student_num_layers 20`
+  在 `_build_runner` 里派生学生 config、加载学生 ckpt，接口零改动。
+
+### 6.6 已知限制与 TODO
+
+- 训练 loop 是**假数据 + 最简 MSE**（`v = noise - x0`），只为验证 forward+backward+save+load
+  通路。真实数据到位后再展开 dataloader、日志、checkpoint 轮换、更长训练。
+- Feature loss 冒烟阶段关掉了（`λ_feat=0`）。开启后显存约 78+ GiB，A800 边缘；下一步用
+  「教师前向截断 + 分块 backward」优化，让 feature loss 在 A800 上可用。
+- 学生参数 2.44B / 教师 3.39B ≈ **71.9%**（层数 20/32 = 62.5%，因 shared 层参数占比略低）；
+  端到端推理 82s vs 教师 96s，实际提速 ~15%（VAE encode/decode 占大头，DiT 只占约一半时间）。
+- 蒸馏训练仅支持 `variant=seedvr2_3b`（`--distill_mode` 会 assert）；其它 variant 走原推理路径。
+
+---
+
+## 7. 直接复用 SeedVR 原推断脚本（不走 Recover）
 
 如果只是想验证 SeedVR 本身工作，可以跳过 `Recover` 直接跑 `run_seedvr2_3b.sh`，
 它会切到 SeedVR 根目录、设 PYTHONPATH 与 CUDA_VISIBLE_DEVICES，再用 torchrun 启动

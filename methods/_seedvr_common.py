@@ -105,6 +105,17 @@ def run_seedvr(
         if method_kwargs.get("train_mode"):
             cmd += ["--train_mode"]
 
+        # 蒸馏训练 / 学生推理专用参数（默认不传 → 走原路径）
+        for opt_key in (
+            "student_num_layers", "student_save_path",
+            "distill_lambda_out", "distill_lambda_feat", "distill_lambda_diff",
+            "warmup_steps",
+        ):
+            if method_kwargs.get(opt_key) is not None:
+                cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
+        if method_kwargs.get("distill_mode"):
+            cmd += ["--distill_mode"]
+
         env = os.environ.copy()
         # PYTHONPATH 让子进程能 import SeedVR 仓库内的 common/ data/ projects/
         env["PYTHONPATH"] = _SEEDVR_ROOT + (
@@ -120,8 +131,8 @@ def run_seedvr(
         if proc.returncode != 0:
             raise RuntimeError(f"SeedVR 子进程退出码非零: {proc.returncode}")
 
-    # 训练模式不产出 mp4，直接返回一个语义占位路径（save_dir 里应有 trainable.pt）
-    if method_kwargs.get("train_mode"):
+    # 训练 / 蒸馏模式不产出 mp4，直接返回 save_dir 作为语义占位路径
+    if method_kwargs.get("train_mode") or method_kwargs.get("distill_mode"):
         return method_kwargs.get("save_dir") or recovered_path
     if not os.path.isfile(recovered_path):
         raise RuntimeError(f"SeedVR 推断结束但未生成输出: {recovered_path}")

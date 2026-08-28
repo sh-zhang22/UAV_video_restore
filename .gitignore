@@ -16,6 +16,10 @@ trainable_*.pt
 mask_*.png
 mask_*.mp4
 
+# 蒸馏训练/测试产物
+runs_distill/
+student_*.pth
+
 # apex 源码编译产物（在目标机器上重新编）
 third_party/apex_src/build/
 third_party/apex_src/apex.egg-info/

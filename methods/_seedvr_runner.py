@@ -61,7 +61,19 @@ def _patch_vae_ckpt(config, vae_ckpt: str) -> None:
     config.vae.checkpoint = vae_ckpt
 
 
-def _build_runner(variant: str, dit_ckpt: str, vae_ckpt: str, sp_size: int):
+def _build_runner(
+    variant: str,
+    dit_ckpt: str,
+    vae_ckpt: str,
+    sp_size: int,
+    override_num_layers: int = None,
+):
+    """构造 VideoDiffusionInfer。
+
+    override_num_layers: 仅用于「学生模型推理」场景 —— 若传值，则在 load_config 后就地把
+    config.dit.model 派生为学生结构（当前只支持 20 层，layer_map 固定），再用学生 ckpt 加载。
+    None（默认）时行为与之前完全一致。
+    """
     from omegaconf import OmegaConf
 
     from common.config import load_config
@@ -71,6 +83,24 @@ def _build_runner(variant: str, dit_ckpt: str, vae_ckpt: str, sp_size: int):
 
     cfg = VARIANTS[variant]
     config = load_config(cfg["config"])
+    OmegaConf.set_readonly(config, False)
+
+    if override_num_layers is not None:
+        # 让 methods._seedvr_distill_utils 可 import
+        _uav_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _uav_root not in sys.path:
+            sys.path.insert(0, _uav_root)
+        from methods._seedvr_distill_utils import (
+            derive_student_config_inplace,
+            TEACHER_LAYER_MAP,
+            STUDENT_NUM_LAYERS,
+        )
+        assert override_num_layers == STUDENT_NUM_LAYERS, (
+            f"当前学生层裁剪映射固定为 {STUDENT_NUM_LAYERS} 层，收到 --student_num_layers={override_num_layers}"
+        )
+        derive_student_config_inplace(config, TEACHER_LAYER_MAP)
+        print(f"[distill] student inference: config.dit.model.num_layers → {STUDENT_NUM_LAYERS}")
+
     runner = VideoDiffusionInfer(config)
     OmegaConf.set_readonly(runner.config, False)
     _patch_vae_ckpt(runner.config, vae_ckpt)
@@ -407,6 +437,17 @@ def main():
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--train_mode", action="store_true")
+    # 蒸馏专用参数（仅 --distill_mode 时启用；未启用时全部无副作用）
+    parser.add_argument("--distill_mode", action="store_true",
+                        help="启用 SeedVR2-3B 层裁剪 + KD 蒸馏训练分支")
+    parser.add_argument("--student_num_layers", type=int, default=None,
+                        help="推理时用学生模型（当前固定 20 层）；训练时也应该传相同的值")
+    parser.add_argument("--student_save_path", default=None,
+                        help="蒸馏产出的学生 ckpt 文件名（相对 save_dir 或绝对路径）")
+    parser.add_argument("--distill_lambda_out", type=float, default=1.0)
+    parser.add_argument("--distill_lambda_feat", type=float, default=0.5)
+    parser.add_argument("--distill_lambda_diff", type=float, default=1.0)
+    parser.add_argument("--warmup_steps", type=int, default=0)
     args = parser.parse_args()
 
     os.chdir(args.seedvr_root)
@@ -420,7 +461,18 @@ def main():
         args.cond_noise_scale if args.cond_noise_scale is not None else cfg["cond_noise_scale"]
     )
 
-    runner = _build_runner(args.variant, args.dit_ckpt, args.vae_ckpt, args.sp_size)
+    # 推理路径若传了 --student_num_layers（且不是蒸馏训练），把 config 派生为学生结构；
+    # 蒸馏训练路径要构造教师，override_num_layers 必须 None
+    inference_student = (
+        args.student_num_layers is not None and not args.distill_mode
+    )
+    runner = _build_runner(
+        args.variant,
+        args.dit_ckpt,
+        args.vae_ckpt,
+        args.sp_size,
+        override_num_layers=args.student_num_layers if inference_student else None,
+    )
     dev = torch.cuda.current_device()
     after_load_alloc = torch.cuda.memory_allocated(dev) / 1024**3
     after_load_reserved = torch.cuda.memory_reserved(dev) / 1024**3
@@ -430,8 +482,18 @@ def main():
     )
     torch.cuda.reset_peak_memory_stats(dev)
 
-    # ---- 分支：ctrl variant ----
-    if args.variant == "seedvr2_3b_ctrl":
+    # ---- 分支 A：蒸馏训练（优先级最高，只支持 seedvr2_3b variant） ----
+    if args.distill_mode:
+        assert args.variant == "seedvr2_3b", (
+            f"蒸馏训练仅支持 --variant seedvr2_3b，收到 {args.variant}"
+        )
+        _uav_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _uav_root not in sys.path:
+            sys.path.insert(0, _uav_root)
+        from methods._seedvr_distill import run_distill
+        run_distill(runner, args, cond_noise_scale=cond_noise_scale)
+    # ---- 分支 B：ctrl variant ----
+    elif args.variant == "seedvr2_3b_ctrl":
         # 让 methods/* 可 import：主进程 chdir 到 SeedVR 根后，UAV_video_repair 项目根不在 sys.path
         _uav_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         # __file__ 是 SeedVR 根目录内的相对路径？不，_seedvr_runner.py 的绝对路径是 UAV_video_repair/methods/_seedvr_runner.py
