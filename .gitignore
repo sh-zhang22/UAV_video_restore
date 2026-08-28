@@ -9,6 +9,13 @@ results/
 test_recovered_*.mp4
 seedvr_io_*/
 
+# ctrl variant 训练/测试产物
+runs_ctrl/
+lora_ckpts/
+trainable_*.pt
+mask_*.png
+mask_*.mp4
+
 # apex 源码编译产物（在目标机器上重新编）
 third_party/apex_src/build/
 third_party/apex_src/apex.egg-info/

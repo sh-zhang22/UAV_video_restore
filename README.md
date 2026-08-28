@@ -1,8 +1,9 @@
 # UAV_video_repair
 
 把"压缩 MP4 → 还原后更清晰的 MP4"这一动作，封装成一个**单一函数 `Recover()`** 的对外接口。
-背后通过 method 注册表挂接多种开源视频还原方法，目前已接入 **SeedVR / SeedVR2** 全系四个变体
-（3B / 7B × v1 / v2）。
+背后通过 method 注册表挂接多种开源视频还原方法，目前已接入 **SeedVR / SeedVR2** 全系四个基础变体
+（3B / 7B × v1 / v2），以及一个正在开发的 **SeedVR2-3B + mask 控制 + LoRA 微调**变体
+`seedvr2_3b_ctrl`（详见 §5）。
 
 ```python
 from recover import Recover
@@ -25,10 +26,13 @@ UAV_video_repair/
 ├── recover.py                  # 对外唯一入口 Recover()
 ├── methods/                    # method 注册表与各方法适配器
 │   ├── _registry.py            # @register 装饰器
-│   ├── _seedvr_common.py       # SeedVR 4 个 variant 共用 dispatch（subprocess+torchrun）
-│   ├── _seedvr_runner.py       # SeedVR 子进程入口（被 torchrun 启动后真正跑推断）
+│   ├── _seedvr_common.py       # SeedVR 5 个 variant 共用 dispatch（subprocess+torchrun）
+│   ├── _seedvr_runner.py       # SeedVR 子进程入口（被 torchrun 启动后真正跑推断/训练）
+│   ├── _seedvr_ctrl_utils.py   # seedvr2_3b_ctrl 专用：mask I/O、causal 下采、LoRA 挂载
+│   ├── _seedvr_train.py        # seedvr2_3b_ctrl 训练分支（冒烟版）
 │   ├── seedvr_3b.py / seedvr_7b.py
-│   └── seedvr2_3b.py / seedvr2_7b.py
+│   ├── seedvr2_3b.py / seedvr2_7b.py
+│   └── seedvr2_3b_ctrl.py      # 第 5 个 variant：mask 控制 + LoRA 微调
 ├── third_party/
 │   ├── SeedVR/                 # ByteDance SeedVR 原仓库（含 configs_3b/7b、common/、data/、projects/、models/、pos_emb.pt、neg_emb.pt）
 │   │   └── ckpts/              # 5 个权重文件，符号链接到 NAS 或 HF 下载产物
@@ -37,8 +41,10 @@ UAV_video_repair/
 │   └── download_ckpts.sh       # 没有共享 NAS 时从 HuggingFace 下载 ckpt 的备选方案
 ├── build_apex.sh               # 在 seedvr conda env 内编 apex (sm_80;86;90)
 ├── run_seedvr2_3b.sh           # 直接调用 SeedVR 原 inference 脚本的演示（绕过 Recover）
-├── test_recover_seedvr2_3b.py  # 通过 Recover 调用 SeedVR2-3B 的端到端测试
-├── test_recover_seedvr2_7b.py  # 同上，SeedVR2-7B
+├── test_recover_seedvr2_3b.py       # 通过 Recover 调用 SeedVR2-3B 的端到端测试
+├── test_recover_seedvr2_7b.py       # 同上，SeedVR2-7B
+├── test_recover_seedvr2_3b_ctrl.py  # ctrl variant 冒烟：mask 控制推理
+├── train_seedvr2_3b_ctrl.py         # ctrl variant 冒烟：LoRA 微调训练
 └── test.mp4                    # 一段示例输入视频
 ```
 
@@ -243,8 +249,16 @@ Recover(
 ```python
 from recover import available_methods
 print(available_methods())
-# ['seedvr2_3b', 'seedvr2_7b', 'seedvr_3b', 'seedvr_7b']
+# ['seedvr2_3b', 'seedvr2_3b_ctrl', 'seedvr2_7b', 'seedvr_3b', 'seedvr_7b']
 ```
+
+`seedvr2_3b_ctrl` 需要额外装一个依赖：
+
+```bash
+pip install peft==0.11.1
+```
+
+具体用法见 §5。
 
 ---
 
@@ -303,10 +317,125 @@ print(available_methods())
   建议 7B 走 `sp_size=2` 多卡。
 - **跑实验前先 `nvidia-smi --query-gpu=memory.free,utilization.gpu --format=csv`** 选空闲卡，
   这台机是公用的。
+- **SeedVR 源码有一处 patch**（`third_party/SeedVR/models/dit_v2/nadit.py:30`）：
+  把原本空实现的 `gradient_checkpointing()` 改成"enabled=False 走原路径、enabled=True 走真的
+  `torch.utils.checkpoint`"。仅 ctrl variant 训练分支会 enabled=True，其余推理路径行为完全不变
+  （已通过 Step 5 逐像素回归验证）。
 
 ---
 
-## 5. 直接复用 SeedVR 原推断脚本（不走 Recover）
+## 5. ctrl variant：SeedVR2-3B + mask 控制 + LoRA 微调
+
+用于无人机视频传输场景：编码端按 ROI 差异化码率（关键物体高码率、其它低码率），
+接收端要做扩散修复但又不能扭曲已经清晰的目标。做法是**把第 17 条件通道**
+（原 sr 任务下恒为 1.0，语义为 validity mask，信息量为 0 → 可回收）**替换为 mask latent**，
+配合 LoRA 微调 + NaPatchIn 首层解冻。
+
+### 5.1 冒烟通路已跑通、暂无真实数据
+
+**当前状态**（截至提交本 README）：
+
+- ✅ 代码流水线搭好，`method="seedvr2_3b_ctrl"` 已注册
+- ✅ 5 步冒烟全部通过：mask 推理、LoRA 训练、LoRA ckpt 加载、原 4 个 method 无回归
+- ⏸  真实"高码率保护区"数据未到位；训练脚本仍在用假数据（test.mp4 + 随机稀疏 mask）
+- ⏸  loss 仍是最简 MSE（`v = noise - x0`），没加 mask-weighted 保真项 —— 等数据到位再讨论
+
+**5 步冒烟结果一览**（`--device cuda:1`，A800 单卡）：
+
+| Step | 场景 | 结果 |
+|---|---|---|
+| 1 | 无 LoRA + 全 1 mask 推理 | 与 baseline `seedvr2_3b` **逐像素 100% 一致** |
+| 2 | 无 LoRA + 稀疏方框 mask (OOD) | 跑通，输出 mp4 存在，视觉预期变差 |
+| 3 | 5 步训练冒烟 | loss 0.70→0.56 单调下降，峰值 52.6G，`trainable.pt` 5.5M 参数 |
+| 4 | 加载 LoRA 后推理 | 无 shape 错、无 unexpected keys；输出与 Step 1 有 89% 像素差异 |
+| 5 | 原 baseline 回归测试 | 与改动前 baseline **逐像素 100% 一致** |
+
+### 5.2 快速上手
+
+**推理**（自动生成全 1 mask，等价 sanity check）：
+
+```bash
+python test_recover_seedvr2_3b_ctrl.py
+# → test_recovered_seedvr2_3b_ctrl_ones.mp4
+```
+
+**推理**（内置中心方框 mask，OOD 测试）：
+
+```bash
+python test_recover_seedvr2_3b_ctrl.py --mask center_box
+# → test_recovered_seedvr2_3b_ctrl_centerbox.mp4
+```
+
+**训练**（冒烟 5 步，产出 `runs_ctrl/trainable.pt`）：
+
+```bash
+python train_seedvr2_3b_ctrl.py --mask sparse_random --train_steps 5
+```
+
+**加载 LoRA 后推理**：
+
+```bash
+python test_recover_seedvr2_3b_ctrl.py --lora_ckpt runs_ctrl/trainable.pt
+```
+
+### 5.3 直接通过 Recover 调用
+
+```python
+Recover(
+    video_path     = "in.mp4",
+    recovered_path = "out.mp4",
+    ckpt_path      = "third_party/SeedVR/ckpts/seedvr2_ema_3b.pth",
+    method         = "seedvr2_3b_ctrl",
+    device         = "cuda:1",
+    method_kwargs  = {
+        "mask_path": "mask.png",            # .png/.jpg/.npy/.mp4；None → 全 1 mask
+        "lora_ckpt": "runs_ctrl/trainable.pt",  # 可选，加载训练后权重
+        "res_h": 720, "res_w": 960, "seed": 666,
+    },
+)
+```
+
+### 5.4 ctrl variant 特有的 method_kwargs
+
+在 §2.2 通用参数之上追加：
+
+| key             | 含义                                                       | 默认值 |
+|-----------------|------------------------------------------------------------|--------|
+| `mask_path`     | pixel-space mask 路径，支持 .png/.jpg/.npy/.mp4；None → 全 1 | None   |
+| `lora_ckpt`     | 训练后权重路径（`save_trainable_state` 产物）                | None   |
+| `train_mode`    | True → 走训练分支，不产出 mp4                                | False  |
+| `save_dir`      | 训练权重保存目录                                             | `./runs_ctrl` |
+| `train_steps`   | 训练步数                                                    | 5      |
+| `lr`            | AdamW 学习率                                                | 1e-4   |
+| `lora_r`        | LoRA rank                                                  | 8      |
+| `lora_alpha`    | LoRA alpha                                                 | 16     |
+
+### 5.5 技术方案要点
+
+- **可训参数**：`peft` LoRA 命中 84 个 Linear（32 层 DiT × 4 个 target × 平均 0.66 的 mm/all 因子）+
+  `vid_in.proj` 显式解冻（weight + bias），共 **5.5M / 3.4B ≈ 0.16%**。
+- **LoRA target regex**：`.*\.(proj_qkv|proj_out|proj_in_gate|proj_in)\.(vid|txt|all)$`。
+  SeedVR 用 `MMModule` 包裹 `.vid/.txt/.all` 子 Linear，peft 的默认后缀匹配会命中外层 MMModule 报错，
+  必须用 regex 精确到内层 Linear。
+- **Mask 时空对齐**：mask 走**和 video 完全相同**的 `NaResize + DivisibleCrop` 空间变换（去掉 Normalize），
+  再复现 VAE 的 causal 4× 时间下采样（第 0 帧独占 latent[0]，之后每 4 帧压 1）。
+- **第 17 通道注入**：在 `runner.get_condition(..., task="sr")` 返回后立即用
+  `override_cond_channel_17` 把原本全 1 的第 17 通道替换为 mask latent。
+- **可训权重存取**：`save_trainable_state` 只保存 `requires_grad=True` 的参数，170 keys（84 lora_A +
+  84 lora_B + 2 vid_in.proj）；加载走 `strict=False`。
+- **训练开真 gradient checkpointing**：见 §4 最后一条。
+
+### 5.6 已知限制与 TODO
+
+- 训练 loop 是**最简 MSE**（`v = noise - x0`），没做 flow-matching / v-lerp 严格目标；
+  也没做 logitnormal timestep 采样。数据到位后再展开。
+- 训练用假数据（同一 batch 重复 N 步），只为验证前向 + 反向 + save/load 通路。
+- 训练峰值显存 ~52G（720×960，96 帧，sp_size=1），A800 单卡够用；后续加长序列或大 batch 可能需要
+  `sp_size≥2` 多卡。
+
+---
+
+## 6. 直接复用 SeedVR 原推断脚本（不走 Recover）
 
 如果只是想验证 SeedVR 本身工作，可以跳过 `Recover` 直接跑 `run_seedvr2_3b.sh`，
 它会切到 SeedVR 根目录、设 PYTHONPATH 与 CUDA_VISIBLE_DEVICES，再用 torchrun 启动

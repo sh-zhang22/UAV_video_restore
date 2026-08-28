@@ -98,6 +98,13 @@ def run_seedvr(
             if method_kwargs.get(opt_key) is not None:
                 cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
 
+        # seedvr2_3b_ctrl 专用的可选参数（其它 variant 不传 → runner 端 default=None，无副作用）
+        for opt_key in ("mask_path", "lora_ckpt", "save_dir", "train_steps", "lr", "lora_r", "lora_alpha"):
+            if method_kwargs.get(opt_key) is not None:
+                cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
+        if method_kwargs.get("train_mode"):
+            cmd += ["--train_mode"]
+
         env = os.environ.copy()
         # PYTHONPATH 让子进程能 import SeedVR 仓库内的 common/ data/ projects/
         env["PYTHONPATH"] = _SEEDVR_ROOT + (
@@ -113,6 +120,9 @@ def run_seedvr(
         if proc.returncode != 0:
             raise RuntimeError(f"SeedVR 子进程退出码非零: {proc.returncode}")
 
+    # 训练模式不产出 mp4，直接返回一个语义占位路径（save_dir 里应有 trainable.pt）
+    if method_kwargs.get("train_mode"):
+        return method_kwargs.get("save_dir") or recovered_path
     if not os.path.isfile(recovered_path):
         raise RuntimeError(f"SeedVR 推断结束但未生成输出: {recovered_path}")
     return recovered_path

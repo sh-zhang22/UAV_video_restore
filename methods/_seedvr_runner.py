@@ -43,6 +43,14 @@ VARIANTS = {
         "cfg_scale": 1.0,
         "sample_steps": 1,
     },
+    # 新增 variant：复用 SeedVR2-3B 权重与 config，推理/训练加 mask 控制 + LoRA
+    "seedvr2_3b_ctrl": {
+        "config": "./configs_3b/main.yaml",
+        "default_dit": "./ckpts/seedvr2_ema_3b.pth",
+        "cond_noise_scale": 0.0,
+        "cfg_scale": 1.0,
+        "sample_steps": 1,
+    },
 }
 
 def _patch_vae_ckpt(config, vae_ckpt: str) -> None:
@@ -212,6 +220,167 @@ def _run_one_video(
     torch.cuda.empty_cache()
 
 
+def _generation_step_ctrl(runner, text_embeds_dict, cond_latents, cond_noise_scale: float, mask_latent):
+    """带 mask 控制的 generation step：在 get_condition 后覆盖第 17 通道。"""
+    from einops import rearrange
+
+    from common.distributed import get_device
+    from common.distributed.ops import sync_data
+
+    from methods._seedvr_ctrl_utils import override_cond_channel_17
+
+    def _to_dev(x):
+        return [i.to(get_device()) for i in x]
+
+    noises = [torch.randn_like(l) for l in cond_latents]
+    aug_noises = [torch.randn_like(l) for l in cond_latents]
+    noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
+    noises, aug_noises, cond_latents = map(_to_dev, (noises, aug_noises, cond_latents))
+    noises, aug_noises, cond_latents = list(noises), list(aug_noises), list(cond_latents)
+
+    def _add_noise(x, aug):
+        t = torch.tensor([1000.0], device=get_device()) * cond_noise_scale
+        shape = torch.tensor(x.shape[1:], device=get_device())[None]
+        t = runner.timestep_transform(t, shape)
+        return runner.schedule.forward(x, aug, t)
+
+    conditions = [
+        runner.get_condition(n, task="sr", latent_blur=_add_noise(lb, an))
+        for n, an, lb in zip(noises, aug_noises, cond_latents)
+    ]
+    # 关键：把原本 sr 任务恒为 1.0 的第 17 通道替换为下采后的 mask_latent
+    conditions = [override_cond_channel_17(c, mask_latent) for c in conditions]
+
+    with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
+        videos = runner.inference(
+            noises=noises, conditions=conditions, dit_offload=True, **text_embeds_dict
+        )
+    return [
+        rearrange(v[:, None] if v.ndim == 3 else v, "c t h w -> t c h w") for v in videos
+    ]
+
+
+def _run_one_video_ctrl(
+    runner,
+    *,
+    in_video: str,
+    out_video: str,
+    mask_path,
+    cfg_scale: float,
+    cfg_rescale: float,
+    sample_steps: int,
+    seed: int,
+    res_h: int,
+    res_w: int,
+    sp_size: int,
+    out_fps,
+    cond_noise_scale: float,
+):
+    """seedvr2_3b_ctrl 推理分支：与 _run_one_video 完全对齐，额外注入 mask。"""
+    import mediapy
+    from einops import rearrange
+    from torchvision.io.video import read_video
+    from torchvision.transforms import Compose, Lambda, Normalize
+
+    from common.distributed import get_device
+    from common.distributed.advanced import get_sequence_parallel_rank
+    from common.seed import set_seed
+    from data.image.transforms.divisible_crop import DivisibleCrop
+    from data.image.transforms.na_resize import NaResize
+    from data.video.transforms.rearrange import Rearrange
+
+    from methods._seedvr_ctrl_utils import (
+        load_mask_as_TCHW,
+        mask_temporal_downsample_causal,
+    )
+
+    runner.config.diffusion.cfg.scale = cfg_scale
+    runner.config.diffusion.cfg.rescale = cfg_rescale
+    runner.config.diffusion.timesteps.sampling.steps = sample_steps
+    runner.configure_diffusion()
+    set_seed(seed, same_across_ranks=True)
+
+    use_colorfix = os.path.exists("./projects/video_diffusion_sr/color_fix.py")
+    if use_colorfix:
+        from projects.video_diffusion_sr.color_fix import wavelet_reconstruction
+
+    text_pos = torch.load("pos_emb.pt")
+    text_neg = torch.load("neg_emb.pt")
+    text_embeds = {"texts_pos": [text_pos.to(get_device())], "texts_neg": [text_neg.to(get_device())]}
+
+    video, _, info = read_video(in_video, output_format="TCHW")
+    video = video.float() / 255.0
+    save_fps = info.get("video_fps", 24.0) if out_fps is None else out_fps
+
+    T_pixel, _, H_pixel, W_pixel = video.shape
+
+    # video: (T,C,H,W) → NaResize + DivisibleCrop + Normalize + Rearrange → (C, T, H_align, W_align)
+    transform = Compose([
+        NaResize(resolution=(res_h * res_w) ** 0.5, mode="area", downsample_only=False),
+        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        DivisibleCrop((16, 16)),
+        Normalize(0.5, 0.5),
+        Rearrange("t c h w -> c t h w"),
+    ])
+    cond_latent = transform(video.to(get_device()))
+    ori_length = cond_latent.size(1)
+    input_video = cond_latent
+    cond_latent = _cut_videos(cond_latent, sp_size)
+
+    # mask: 走完全相同的空间变换（去掉 Normalize，mask 是 [0,1]），确保与 video 严格对齐
+    mask_tchw = load_mask_as_TCHW(
+        mask_path, num_frames=T_pixel, height=H_pixel, width=W_pixel
+    ).to(get_device())
+    mask_transform = Compose([
+        NaResize(resolution=(res_h * res_w) ** 0.5, mode="area", downsample_only=False),
+        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        DivisibleCrop((16, 16)),
+        Rearrange("t c h w -> c t h w"),
+    ])
+    mask_ctchw = mask_transform(mask_tchw)                     # (1, T_pixel, H_align, W_align)
+    mask_ctchw = _cut_videos(mask_ctchw, sp_size)              # (1, T_padded, H_align, W_align)
+    mask_tchw_aligned = mask_ctchw.permute(1, 0, 2, 3).contiguous()  # (T_padded, 1, H, W)
+
+    runner.dit.to("cpu")
+    runner.vae.to(get_device())
+    cond_latents = runner.vae_encode([cond_latent])
+    runner.vae.to("cpu")
+    runner.dit.to(get_device())
+
+    # VAE encode 完成后才知道 latent 时间维；对 mask 做同构（causal 4x 时间 + 8x 空间）下采
+    # cond_latents[0] 的 shape 是 (T, H, W, C)：SeedVR VAE 输出经过 "b c ... -> b ... c" 重排 + squeeze(0)
+    T_latent = cond_latents[0].shape[0]
+    mask_latent = mask_temporal_downsample_causal(
+        mask_tchw_aligned, T_latent=T_latent, spatial_stride=8
+    ).to(get_device())                                          # (T_latent, H/8, W/8, 1)
+
+    samples = _generation_step_ctrl(
+        runner, text_embeds, cond_latents, cond_noise_scale, mask_latent
+    )
+    runner.dit.to("cpu")
+
+    if get_sequence_parallel_rank() != 0:
+        return
+
+    sample = samples[0]
+    if ori_length < sample.shape[0]:
+        sample = sample[:ori_length]
+    inp = (
+        rearrange(input_video[:, None] if input_video.ndim == 3 else input_video, "c t h w -> t c h w")
+    )
+    if use_colorfix:
+        sample = wavelet_reconstruction(sample.to("cpu"), inp[: sample.size(0)].to("cpu"))
+    else:
+        sample = sample.to("cpu")
+    sample = rearrange(sample[:, None] if sample.ndim == 3 else sample, "t c h w -> t h w c")
+    sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).numpy()
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_video)) or ".", exist_ok=True)
+    mediapy.write_video(out_video, sample, fps=save_fps)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", required=True, choices=list(VARIANTS.keys()))
@@ -229,6 +398,15 @@ def main():
     parser.add_argument("--sample_steps", type=int, default=None)
     parser.add_argument("--cond_noise_scale", type=float, default=None)
     parser.add_argument("--out_fps", type=float, default=None)
+    # seedvr2_3b_ctrl 专用参数（其它 variant 不会传，全部 default=None/False）
+    parser.add_argument("--mask_path", default=None)
+    parser.add_argument("--lora_ckpt", default=None)
+    parser.add_argument("--save_dir", default=None)
+    parser.add_argument("--train_steps", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--train_mode", action="store_true")
     args = parser.parse_args()
 
     os.chdir(args.seedvr_root)
@@ -251,20 +429,70 @@ def main():
         f"reserved={after_load_reserved:.2f} GiB"
     )
     torch.cuda.reset_peak_memory_stats(dev)
-    _run_one_video(
-        runner,
-        in_video=args.in_video,
-        out_video=args.out_video,
-        cfg_scale=cfg_scale,
-        cfg_rescale=args.cfg_rescale,
-        sample_steps=sample_steps,
-        seed=args.seed,
-        res_h=args.res_h,
-        res_w=args.res_w,
-        sp_size=args.sp_size,
-        out_fps=args.out_fps,
-        cond_noise_scale=cond_noise_scale,
-    )
+
+    # ---- 分支：ctrl variant ----
+    if args.variant == "seedvr2_3b_ctrl":
+        # 让 methods/* 可 import：主进程 chdir 到 SeedVR 根后，UAV_video_repair 项目根不在 sys.path
+        _uav_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        # __file__ 是 SeedVR 根目录内的相对路径？不，_seedvr_runner.py 的绝对路径是 UAV_video_repair/methods/_seedvr_runner.py
+        # 从这里往上两级 = UAV_video_repair
+        _uav_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _uav_root not in sys.path:
+            sys.path.insert(0, _uav_root)
+
+        from methods._seedvr_ctrl_utils import (
+            attach_lora, unfreeze_vid_in_proj, load_trainable_state, count_trainable_params,
+        )
+
+        runner.dit = attach_lora(runner.dit, r=args.lora_r, alpha=args.lora_alpha)
+        n_unfrozen = unfreeze_vid_in_proj(runner.dit)
+        stats = count_trainable_params(runner.dit)
+        print(
+            f"[LoRA] trainable={stats['trainable']:,} / total={stats['total']:,} "
+            f"({stats['ratio']*100:.3f}%); vid_in.proj unfrozen params (weight+bias): {n_unfrozen}"
+        )
+
+        if args.lora_ckpt:
+            unexpected = load_trainable_state(runner.dit, args.lora_ckpt)
+            if unexpected:
+                print(f"[LoRA] unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+            else:
+                print(f"[LoRA] loaded {args.lora_ckpt}")
+
+        if args.train_mode:
+            from methods._seedvr_train import run_train
+            run_train(runner, args, cond_noise_scale=cond_noise_scale)
+        else:
+            _run_one_video_ctrl(
+                runner,
+                in_video=args.in_video,
+                out_video=args.out_video,
+                mask_path=args.mask_path,
+                cfg_scale=cfg_scale,
+                cfg_rescale=args.cfg_rescale,
+                sample_steps=sample_steps,
+                seed=args.seed,
+                res_h=args.res_h,
+                res_w=args.res_w,
+                sp_size=args.sp_size,
+                out_fps=args.out_fps,
+                cond_noise_scale=cond_noise_scale,
+            )
+    else:
+        _run_one_video(
+            runner,
+            in_video=args.in_video,
+            out_video=args.out_video,
+            cfg_scale=cfg_scale,
+            cfg_rescale=args.cfg_rescale,
+            sample_steps=sample_steps,
+            seed=args.seed,
+            res_h=args.res_h,
+            res_w=args.res_w,
+            sp_size=args.sp_size,
+            out_fps=args.out_fps,
+            cond_noise_scale=cond_noise_scale,
+        )
 
     dev = torch.cuda.current_device()
     peak_alloc = torch.cuda.max_memory_allocated(dev) / 1024**3
