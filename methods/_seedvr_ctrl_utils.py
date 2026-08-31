@@ -32,6 +32,14 @@ def load_mask_as_TCHW(
     if not mask_path or mask_path.lower() in ("none", "null", ""):
         return torch.ones(num_frames, 1, height, width, dtype=torch.float32)
 
+    # 子进程会 chdir 到 SeedVR 根 → 相对路径需要在调用方转成绝对；这里给一个明确的错误
+    if not os.path.isfile(mask_path):
+        raise FileNotFoundError(
+            f"mask_path 找不到: {mask_path}\n"
+            f"当前工作目录: {os.getcwd()}\n"
+            f"提示：调用方需要传绝对路径（子进程会 chdir 到 SeedVR 根目录）"
+        )
+
     ext = os.path.splitext(mask_path)[1].lower()
 
     if ext == ".npy":

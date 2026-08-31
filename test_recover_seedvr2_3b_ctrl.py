@@ -75,7 +75,8 @@ def main():
         "seed": 666,
     }
     if mask_path is not None:
-        method_kwargs["mask_path"] = mask_path
+        # 子进程会 chdir 到 SeedVR 根目录 → mask 相对路径会失效，必须转绝对
+        method_kwargs["mask_path"] = os.path.abspath(mask_path)
     if args.lora_ckpt is not None:
         method_kwargs["lora_ckpt"] = os.path.abspath(args.lora_ckpt)
 

@@ -433,6 +433,68 @@ Recover(
 - 训练峰值显存 ~52G（720×960，96 帧，sp_size=1），A800 单卡够用；后续加长序列或大 batch 可能需要
   `sp_size≥2` 多卡。
 
+### 5.7 用 YOLO 自动生成 mask
+
+在无 GT mask 的情况下，用 **Ultralytics YOLOv8** 自动从视频里检出目标区域，生成 mask.mp4
+再喂给 ctrl variant。**离线预处理**，与推理管线解耦，不侵入 `Recover()` 调用链。
+
+**装依赖**（`seedvr` env 里）：
+
+```bash
+pip install ultralytics
+# 首次使用 yolov8n.pt 会自动从 GitHub release 下载（6 MB）
+```
+
+**生成 mask**：
+
+```bash
+# 最简：保留所有 COCO 80 类，默认阈值 0.25，膨胀 4 像素
+python make_mask_from_video.py \
+    --in_video test.mp4 --out_mask mask_yolo.mp4 \
+    --device cuda:2 --dilate 4
+
+# 只保留 person + car
+python make_mask_from_video.py \
+    --in_video test.mp4 --out_mask mask_yolo.mp4 \
+    --classes person car --conf 0.25 --dilate 4 --device cuda:2
+
+# 用自己的 UAV 微调 ckpt（只要接口是 Ultralytics YOLO）
+python make_mask_from_video.py \
+    --in_video test.mp4 --out_mask mask_yolo.mp4 \
+    --yolo_ckpt path/to/my_uav_yolo.pt
+```
+
+**喂给 ctrl variant**：
+
+```bash
+python test_recover_seedvr2_3b_ctrl.py --mask_path mask_yolo.mp4 --device cuda:1
+```
+
+**冒烟结果**（`test.mp4`，84 帧 720×960，`--device cuda:2`，`--dilate 4`）：
+
+| Step | 场景 | 结果 |
+|---|---|---|
+| Y1 | 装 ultralytics + 加载 yolov8n | 无冲突，torch 2.4.0 未被动 |
+| Y2 | 生成 mask.mp4 | 5.4s，75 boxes，覆盖 5.43%，落盘 39 KB |
+| Y3 | ctrl variant 消费 YOLO mask | 端到端 140s，输出 mp4 生成 |
+| Y4 | 原 ctrl 冒烟（ones + center_box） | 均无回归 |
+
+**技术方案要点**：
+
+- **bbox mask，非 seg**：稳定优先。逐帧 `YOLO.predict()` 拿 `boxes.xyxy`，直接填 1；不上
+  YOLOv8-seg 实例分割也不上 temporal smoothing / 卡尔曼追踪，避免多余复杂度。等基线稳了再升级。
+- **格式兼容**：输出 (T, H, W) uint8 → 三通道复制写 mp4；消费端
+  `_seedvr_ctrl_utils.load_mask_as_TCHW` 已支持 `.mp4`，走 `mean(dim=1)/255.0` 自动转灰度归一。
+- **绝对路径**：SeedVR 子进程会 chdir 到 SeedVR 根目录 → mask 相对路径失效。`test_recover_*_ctrl.py`
+  已把 `--mask_path` 转 abspath；同时 `load_mask_as_TCHW` 加了存在性检查，找不到会直接报错。
+- **不侵入调用链**：`Recover()` 签名、5 个 method 适配器、SeedVR 源码均未改动。
+
+**已知限制**：
+
+- 只在 COCO 80 类上有效；UAV 场景（如"目标是 30m 外的小型无人机"）建议用领域微调 ckpt。
+- 无帧间平滑，YOLO 单帧漏检会导致 mask 该帧变全 0。若目标运动缓慢可以自行加时序 max-pool 后处理。
+- YOLOv8n 是 nano 版（6M 参数），追求速度；召回不够可以换 `yolov8s.pt` / `yolov8m.pt`。
+
 ---
 
 ## 6. 蒸馏：SeedVR2-3B 层裁剪 + KD（32 → 20 层）
