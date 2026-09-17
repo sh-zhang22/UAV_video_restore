@@ -51,6 +51,15 @@ VARIANTS = {
         "cfg_scale": 1.0,
         "sample_steps": 1,
     },
+    # 新增 variant：SeedVR2-3B + ControlNet-Lite 侧枝（mask 独立条件输入）
+    # 与 ctrl 分支的区别：不动第 17 通道，用侧枝网络 + zero-init 残差注入
+    "seedvr2_3b_ctrlnet": {
+        "config": "./configs_3b/main.yaml",
+        "default_dit": "./ckpts/seedvr2_ema_3b.pth",
+        "cond_noise_scale": 0.0,
+        "cfg_scale": 1.0,
+        "sample_steps": 1,
+    },
 }
 
 def _patch_vae_ckpt(config, vae_ckpt: str) -> None:
@@ -411,6 +420,166 @@ def _run_one_video_ctrl(
     torch.cuda.empty_cache()
 
 
+def _generation_step_ctrlnet(runner, text_embeds_dict, cond_latents, cond_noise_scale: float, mask_latent):
+    """ControlNet 侧枝分支的 generation step：不覆盖第 17 通道，
+    在调 runner.inference 前 set_mask 让 ControlledDiT 内部读取。"""
+    from einops import rearrange
+
+    from common.distributed import get_device
+    from common.distributed.ops import sync_data
+
+    def _to_dev(x):
+        return [i.to(get_device()) for i in x]
+
+    noises = [torch.randn_like(l) for l in cond_latents]
+    aug_noises = [torch.randn_like(l) for l in cond_latents]
+    noises, aug_noises, cond_latents = sync_data((noises, aug_noises, cond_latents), 0)
+    noises, aug_noises, cond_latents = map(_to_dev, (noises, aug_noises, cond_latents))
+    noises, aug_noises, cond_latents = list(noises), list(aug_noises), list(cond_latents)
+
+    def _add_noise(x, aug):
+        t = torch.tensor([1000.0], device=get_device()) * cond_noise_scale
+        shape = torch.tensor(x.shape[1:], device=get_device())[None]
+        t = runner.timestep_transform(t, shape)
+        return runner.schedule.forward(x, aug, t)
+
+    conditions = [
+        runner.get_condition(n, task="sr", latent_blur=_add_noise(lb, an))
+        for n, an, lb in zip(noises, aug_noises, cond_latents)
+    ]
+    # 注意：不覆盖第 17 通道；mask 走侧枝网络
+    runner.dit.set_mask(mask_latent)
+    try:
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
+            videos = runner.inference(
+                noises=noises, conditions=conditions, dit_offload=True, **text_embeds_dict
+            )
+    finally:
+        runner.dit.set_mask(None)  # 防止外部拿到过期 mask
+
+    return [
+        rearrange(v[:, None] if v.ndim == 3 else v, "c t h w -> t c h w") for v in videos
+    ]
+
+
+def _run_one_video_ctrlnet(
+    runner,
+    *,
+    in_video: str,
+    out_video: str,
+    mask_path,
+    cfg_scale: float,
+    cfg_rescale: float,
+    sample_steps: int,
+    seed: int,
+    res_h: int,
+    res_w: int,
+    sp_size: int,
+    out_fps,
+    cond_noise_scale: float,
+):
+    """seedvr2_3b_ctrlnet 推理分支：mask 处理与 _run_one_video_ctrl 一致，
+    但走 _generation_step_ctrlnet（侧枝注入 + 第 17 通道保持原语义）。"""
+    import mediapy
+    from einops import rearrange
+    from torchvision.io.video import read_video
+    from torchvision.transforms import Compose, Lambda, Normalize
+
+    from common.distributed import get_device
+    from common.distributed.advanced import get_sequence_parallel_rank
+    from common.seed import set_seed
+    from data.image.transforms.divisible_crop import DivisibleCrop
+    from data.image.transforms.na_resize import NaResize
+    from data.video.transforms.rearrange import Rearrange
+
+    from methods._seedvr_ctrl_utils import (
+        load_mask_as_TCHW,
+        mask_temporal_downsample_causal,
+    )
+
+    runner.config.diffusion.cfg.scale = cfg_scale
+    runner.config.diffusion.cfg.rescale = cfg_rescale
+    runner.config.diffusion.timesteps.sampling.steps = sample_steps
+    runner.configure_diffusion()
+    set_seed(seed, same_across_ranks=True)
+
+    use_colorfix = os.path.exists("./projects/video_diffusion_sr/color_fix.py")
+    if use_colorfix:
+        from projects.video_diffusion_sr.color_fix import wavelet_reconstruction
+
+    text_pos = torch.load("pos_emb.pt")
+    text_neg = torch.load("neg_emb.pt")
+    text_embeds = {"texts_pos": [text_pos.to(get_device())], "texts_neg": [text_neg.to(get_device())]}
+
+    video, _, info = read_video(in_video, output_format="TCHW")
+    video = video.float() / 255.0
+    save_fps = info.get("video_fps", 24.0) if out_fps is None else out_fps
+
+    T_pixel, _, H_pixel, W_pixel = video.shape
+
+    transform = Compose([
+        NaResize(resolution=(res_h * res_w) ** 0.5, mode="area", downsample_only=False),
+        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        DivisibleCrop((16, 16)),
+        Normalize(0.5, 0.5),
+        Rearrange("t c h w -> c t h w"),
+    ])
+    cond_latent = transform(video.to(get_device()))
+    ori_length = cond_latent.size(1)
+    input_video = cond_latent
+    cond_latent = _cut_videos(cond_latent, sp_size)
+
+    mask_tchw = load_mask_as_TCHW(
+        mask_path, num_frames=T_pixel, height=H_pixel, width=W_pixel
+    ).to(get_device())
+    mask_transform = Compose([
+        NaResize(resolution=(res_h * res_w) ** 0.5, mode="area", downsample_only=False),
+        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        DivisibleCrop((16, 16)),
+        Rearrange("t c h w -> c t h w"),
+    ])
+    mask_ctchw = mask_transform(mask_tchw)
+    mask_ctchw = _cut_videos(mask_ctchw, sp_size)
+    mask_tchw_aligned = mask_ctchw.permute(1, 0, 2, 3).contiguous()
+
+    runner.dit.to("cpu")
+    runner.vae.to(get_device())
+    cond_latents = runner.vae_encode([cond_latent])
+    runner.vae.to("cpu")
+    runner.dit.to(get_device())
+
+    T_latent = cond_latents[0].shape[0]
+    mask_latent = mask_temporal_downsample_causal(
+        mask_tchw_aligned, T_latent=T_latent, spatial_stride=8
+    ).to(get_device())                                          # (T_latent, H/8, W/8, 1)
+
+    samples = _generation_step_ctrlnet(
+        runner, text_embeds, cond_latents, cond_noise_scale, mask_latent
+    )
+    runner.dit.to("cpu")
+
+    if get_sequence_parallel_rank() != 0:
+        return
+
+    sample = samples[0]
+    if ori_length < sample.shape[0]:
+        sample = sample[:ori_length]
+    inp = (
+        rearrange(input_video[:, None] if input_video.ndim == 3 else input_video, "c t h w -> t c h w")
+    )
+    if use_colorfix:
+        sample = wavelet_reconstruction(sample.to("cpu"), inp[: sample.size(0)].to("cpu"))
+    else:
+        sample = sample.to("cpu")
+    sample = rearrange(sample[:, None] if sample.ndim == 3 else sample, "t c h w -> t h w c")
+    sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).numpy()
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_video)) or ".", exist_ok=True)
+    mediapy.write_video(out_video, sample, fps=save_fps)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", required=True, choices=list(VARIANTS.keys()))
@@ -437,6 +606,11 @@ def main():
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--train_mode", action="store_true")
+    # seedvr2_3b_ctrlnet 专用参数
+    parser.add_argument("--ctrlnet_ckpt", default=None,
+                        help="加载 ControlNet 侧枝权重（mask_stem + side_blocks + zero_convs）")
+    parser.add_argument("--ctrlnet_K", type=int, default=4,
+                        help="ControlNet 侧枝层数，注入到主干前 K 层输出（默认 4）")
     # 蒸馏专用参数（仅 --distill_mode 时启用；未启用时全部无副作用）
     parser.add_argument("--distill_mode", action="store_true",
                         help="启用 SeedVR2-3B 层裁剪 + KD 蒸馏训练分支")
@@ -526,6 +700,57 @@ def main():
             run_train(runner, args, cond_noise_scale=cond_noise_scale)
         else:
             _run_one_video_ctrl(
+                runner,
+                in_video=args.in_video,
+                out_video=args.out_video,
+                mask_path=args.mask_path,
+                cfg_scale=cfg_scale,
+                cfg_rescale=args.cfg_rescale,
+                sample_steps=sample_steps,
+                seed=args.seed,
+                res_h=args.res_h,
+                res_w=args.res_w,
+                sp_size=args.sp_size,
+                out_fps=args.out_fps,
+                cond_noise_scale=cond_noise_scale,
+            )
+    # ---- 分支 C：ControlNet-Lite 侧枝 variant ----
+    elif args.variant == "seedvr2_3b_ctrlnet":
+        _uav_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _uav_root not in sys.path:
+            sys.path.insert(0, _uav_root)
+
+        from methods._seedvr_ctrlnet_utils import (
+            wrap_with_controlnet, load_ctrlnet_state, count_ctrlnet_params,
+        )
+        from common.distributed import get_device
+
+        runner.dit = wrap_with_controlnet(
+            runner.dit,
+            config_dit_model=runner.config.dit.model,
+            K=int(args.ctrlnet_K),
+        )
+        stats = count_ctrlnet_params(runner.dit)
+        print(
+            f"[ctrlnet] base={stats['base']:,} side={stats['side']:,} "
+            f"trainable={stats['trainable']:,} "
+            f"ratio(side/base)={stats['ratio_side_over_base']*100:.2f}%"
+        )
+        # 侧枝构造时在 cpu，to(device) 把它移到主干同一 device
+        runner.dit.to(get_device())
+
+        if args.ctrlnet_ckpt:
+            unexpected = load_ctrlnet_state(runner.dit, args.ctrlnet_ckpt)
+            if unexpected:
+                print(f"[ctrlnet] unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+            else:
+                print(f"[ctrlnet] loaded {args.ctrlnet_ckpt}")
+
+        if args.train_mode:
+            from methods._seedvr_ctrlnet_train import run_train
+            run_train(runner, args, cond_noise_scale=cond_noise_scale)
+        else:
+            _run_one_video_ctrlnet(
                 runner,
                 in_video=args.in_video,
                 out_video=args.out_video,

@@ -1,0 +1,8 @@
+# ByteTrack: 宽松版，让低分框也进入二次关联
+tracker_type: bytetrack
+track_high_thresh: 0.25    # 首关联阈值（默认 0.25，不变）
+track_low_thresh: 0.02     # 二次关联下界大幅降低（默认 0.1）—— 承接 conf ∈ [0.02, 0.1] 的框
+new_track_thresh: 0.25     # 新 track 起始阈值（默认 0.25，不变）
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True

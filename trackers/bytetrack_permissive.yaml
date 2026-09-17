@@ -1,0 +1,8 @@
+# ByteTrack: 宽容版，让短暂目标也进 tracker + 长遮挡保 track
+tracker_type: bytetrack
+track_high_thresh: 0.25    # 首关联阈值不变
+track_low_thresh: 0.05     # 与 predict conf 一致，避免二次关联时误伤
+new_track_thresh: 0.10     # 大幅降低（0.25→0.10），让短暂检测也能起 track
+track_buffer: 60           # 提升 30→60，允许 3s 内的长遮挡保 track
+match_thresh: 0.8
+fuse_score: True

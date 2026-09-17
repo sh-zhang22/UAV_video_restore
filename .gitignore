@@ -20,6 +20,14 @@ mask_*.mp4
 runs_distill/
 student_*.pth
 
+# ctrlnet variant 训练/测试产物
+runs_ctrlnet/
+ctrlnet_*.pt
+mask_train_ctrlnet_*.png
+
+# metrics 冒烟产物
+noisy_pred.mp4
+
 # YOLO 自动下载的预训练 ckpt
 yolov8*.pt
 yolov5*.pt
@@ -32,7 +40,31 @@ third_party/apex_src/apex.egg-info/
 # SeedVR 下载缓存
 third_party/SeedVR/ckpts/.cache/
 
-# 编辑器
+# 编辑器 / agent
 .vscode/
 .idea/
 .DS_Store
+.claude/
+
+# 压缩部分
+task3_video_codec_baselines_20260907/
+
+# YOLO 微调 ckpt（>200M，README §5 说明如何获取；不入库）
+ckpts_yolo/
+
+# YOLO 检测评估 / 扫参产物
+eval_baseline/
+eval_recommended/
+eval_v*_sweep/
+eval_v*_imgsz/
+eval_compress_restore/
+
+# 检测可视化产物
+vis_analysis/
+vis_compress_restore/
+vis_compress_restore_diff/
+vis_compress_restore_triple/
+
+# 根目录 stray 日志（跑长实验时常用 `>logs_xxx.txt` 落盘）
+/logs_*.txt
+/log_*.txt

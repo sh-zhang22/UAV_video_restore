@@ -1,0 +1,8 @@
+# ByteTrack: 严格版，减少假 track / 假框累积
+tracker_type: bytetrack
+track_high_thresh: 0.35   # 首关联阈值提高（默认 0.25）
+track_low_thresh: 0.1     # 二次关联下界（默认 0.1，不变）
+new_track_thresh: 0.5     # 新 track 起始阈值大幅提高（默认 0.25）
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True

@@ -17,7 +17,7 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from recover import Recover, available_methods  # noqa: E402
 
 
@@ -32,13 +32,42 @@ def _make_center_box_mask(out_path: str, h: int = 720, w: int = 1280) -> str:
     return out_path
 
 
+def _make_inv_center_box_mask(out_path: str, h: int = 720, w: int = 1280) -> str:
+    """反转 centerbox：周围 = 1（sr 训练见过的语义），中心方框 = 0（OOD）。
+    验证「周围正常修复、中心尝试保留原画」的假设。"""
+    from PIL import Image
+    m = np.full((h, w), 255, dtype=np.uint8)
+    y0, y1 = h // 2 - h // 8, h // 2 + h // 8
+    x0, x1 = w // 2 - w // 8, w // 2 + w // 8
+    m[y0:y1, x0:x1] = 0
+    Image.fromarray(m).save(out_path)
+    return out_path
+
+
+def _make_sat_center_box_mask(out_path: str, h: int = 720, w: int = 1280) -> str:
+    """超饱和 centerbox：周围 = 1.0（训练语义），中心方框 = 2.0（数值 OOD 探针）。
+    走 .npy 通路：load_mask_as_TCHW 里 max>1.5 时不除 255，直接保留 2.0。
+    验证「>1 的值能否触发某种抑制修复的效应」。"""
+    m = np.ones((h, w), dtype=np.float32)
+    y0, y1 = h // 2 - h // 8, h // 2 + h // 8
+    x0, x1 = w // 2 - w // 8, w // 2 + w // 8
+    m[y0:y1, x0:x1] = 2.0
+    np.save(out_path, m)
+    return out_path
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mask",
         default="ones",
-        choices=["ones", "center_box"],
-        help="ones=全 1（sanity check）; center_box=稀疏中心方框（OOD）",
+        choices=["ones", "center_box", "inv_center_box", "sat_center_box"],
+        help=(
+            "ones=全 1（sanity check）; "
+            "center_box=周围 0 中心 1（当前状态）; "
+            "inv_center_box=周围 1 中心 0（尝试保留中心原画）; "
+            "sat_center_box=周围 1 中心 2（数值 OOD 探针）"
+        ),
     )
     parser.add_argument("--mask_path", default=None,
                         help="显式给一个 mask 文件路径，覆盖 --mask 选项")
@@ -62,6 +91,16 @@ def main():
             os.path.abspath("mask_center_box.png")
         )
         mask_tag = "centerbox"
+    elif args.mask == "inv_center_box":
+        mask_path = _make_inv_center_box_mask(
+            os.path.abspath("mask_inv_center_box.png")
+        )
+        mask_tag = "invcenterbox"
+    elif args.mask == "sat_center_box":
+        mask_path = _make_sat_center_box_mask(
+            os.path.abspath("mask_sat_center_box.npy")
+        )
+        mask_tag = "satcenterbox"
     else:
         raise ValueError(args.mask)
 

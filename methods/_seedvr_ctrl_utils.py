@@ -46,8 +46,8 @@ def load_mask_as_TCHW(
         import numpy as np
         arr = np.load(mask_path)
         m = torch.from_numpy(arr).float()
-        if m.max() > 1.5:                # 猜是 uint8 in [0,255]
-            m = m / 255.0
+        if m.max() > 10.0:               # 猜是 uint8 in [0,255]；阈值放宽到 10 以允许
+            m = m / 255.0                #   float 探针值（如 2.0、3.0）不被误当作 uint8
         if m.ndim == 2:                  # (H, W)
             m = m[None, None].expand(num_frames, 1, -1, -1)
         elif m.ndim == 3:                # (T, H, W)

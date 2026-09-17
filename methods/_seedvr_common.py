@@ -98,12 +98,17 @@ def run_seedvr(
             if method_kwargs.get(opt_key) is not None:
                 cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
 
-        # seedvr2_3b_ctrl 专用的可选参数（其它 variant 不传 → runner 端 default=None，无副作用）
+        # seedvr2_3b_ctrl / seedvr2_3b_ctrlnet 共用的可选参数（其它 variant 不传 → runner 端 default=None，无副作用）
         for opt_key in ("mask_path", "lora_ckpt", "save_dir", "train_steps", "lr", "lora_r", "lora_alpha"):
             if method_kwargs.get(opt_key) is not None:
                 cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
         if method_kwargs.get("train_mode"):
             cmd += ["--train_mode"]
+
+        # seedvr2_3b_ctrlnet 专用参数
+        for opt_key in ("ctrlnet_ckpt", "ctrlnet_K"):
+            if method_kwargs.get(opt_key) is not None:
+                cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
 
         # 蒸馏训练 / 学生推理专用参数（默认不传 → 走原路径）
         for opt_key in (
