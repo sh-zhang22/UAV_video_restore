@@ -270,12 +270,13 @@ def _run_one_video(
         if seg_len < sample.shape[0]:
             sample = sample[:seg_len]
         inp = rearrange(seg[:, None] if seg.ndim == 3 else seg, "c t h w -> t c h w")
+        # wavelet_reconstruction 在 GPU 上做（此时 DiT/VAE 都已 to("cpu")，GPU 显存宽裕）
+        # 每段处理完再挪 CPU 拼接，避免 samples_all 常驻 GPU
         if use_colorfix:
-            sample = wavelet_reconstruction(sample.to("cpu"), inp[: sample.size(0)].to("cpu"))
-        else:
-            sample = sample.to("cpu")
-        samples_all.append(sample)
-        del samples, cond_latents, seg_padded, seg, inp
+            sample = wavelet_reconstruction(sample, inp[: sample.size(0)])
+        samples_all.append(sample.to("cpu"))
+        del samples, cond_latents, seg_padded, seg, inp, sample
+        gc.collect(); torch.cuda.empty_cache()
 
     if get_sequence_parallel_rank() != 0:
         return
