@@ -40,8 +40,9 @@ from scripts.eval.eval_yolo_visdrone import (
     load_gt, boxes_to_mask, frame_iou,
 )
 
-VVENC = Path(__file__).resolve().parents[2] / "task3_video_codec_baselines_20260907/third_party/vvenc-1.14.0/bin/release-static/vvencFFapp"
-CKPT_SEEDVR = Path(__file__).parent / "third_party/SeedVR/ckpts/seedvr2_ema_3b.pth"
+_PROJ_ROOT = Path(__file__).resolve().parents[2]
+VVENC = _PROJ_ROOT / "task3_video_codec_baselines_20260907/third_party/vvenc-1.14.0/bin/release-static/vvencFFapp"
+CKPT_SEEDVR = _PROJ_ROOT / "third_party/SeedVR/ckpts/seedvr2_ema_3b.pth"
 
 # 默认压缩参数（与 build_uavid_trainpairs.py 完全一致；可被 CLI 覆盖）
 Q_ROI = 22
@@ -87,6 +88,34 @@ def probe_video(path):
             capture_output=True, text=True, check=True)
         nb = int(r2.stdout.strip())
     return W, H, fps, nb
+
+
+def restored_to_orig_boxes(pred, W_o, H_o, W_r, H_r, max_area):
+    """restored 空间下的 xyxy 框列表 → orig 空间。
+
+    SeedVR pipeline: NaResize(area, downsample_only=False) → DivisibleCrop((16,16), center)。
+    逆变换：先反向 center-crop（+offset），再反向 area resize（/scale）。
+    max_area = res_h * res_w（SeedVR 目标像素面积）。
+
+    当算出的 (H_r_expected, W_r_expected) 与 probe 得到的 (H_r, W_r) 不一致时，
+    退化到按比例缩放（旧行为，不准但不崩），并打印警告。
+    """
+    import math
+    scale = math.sqrt(max_area / (H_o * W_o))
+    H1, W1 = round(H_o * scale), round(W_o * scale)
+    H_r_expected = H1 - (H1 % 16)
+    W_r_expected = W1 - (W1 % 16)
+    if (H_r_expected, W_r_expected) != (H_r, W_r):
+        print(f"    [warn] restored 空间与 SeedVR pipeline 推算不匹配："
+              f"expected {W_r_expected}x{H_r_expected}, got {W_r}x{H_r}；退化到 scale-based 反变换")
+        sx, sy = W_o / W_r, H_o / H_r
+        return [[[x1*sx, y1*sy, x2*sx, y2*sy] for (x1, y1, x2, y2) in fr] for fr in pred]
+    crop_left = (W1 - W_r) // 2
+    crop_top = (H1 - H_r) // 2
+    def _m(x1, y1, x2, y2):
+        return [(x1 + crop_left) / scale, (y1 + crop_top) / scale,
+                (x2 + crop_left) / scale, (y2 + crop_top) / scale]
+    return [[_m(*b) for b in fr] for fr in pred]
 
 
 def extract_clean_yuv(mp4, W, H, n_frames, out_yuv, work):
@@ -345,7 +374,8 @@ def compute_miou_pred_pred(pred_a, pred_b, W, H):
 
 def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
                   yolo_model, sp_size=1, seedvr_kwargs_extra=None,
-                  q_roi=Q_ROI, q_bg=Q_BG, skip_seedvr=False):
+                  q_roi=Q_ROI, q_bg=Q_BG, skip_seedvr=False,
+                  max_area=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -433,13 +463,26 @@ def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
         print(f"  [B/C/D] compressed.mp4 cached")
 
     # Step E: SeedVR2-3B 修复
+    # 自适应 res_h/res_w：小视频用原分辨率；大视频等比缩到 max_area 面积上限（保持长宽比）
+    import math as _m
+    if max_area is not None and H * W > max_area:
+        _s = _m.sqrt(max_area / (H * W))
+        seedvr_res_h = round(H * _s)
+        seedvr_res_w = round(W * _s)
+    else:
+        seedvr_res_h, seedvr_res_w = H, W
+    effective_max_area = seedvr_res_h * seedvr_res_w
+
     if skip_seedvr:
         print(f"  [E] skip_seedvr=True，跳过修复；restored 相关字段留空")
         pred_restored_scaled = None
         W_r, H_r, nb_r = W, H, nb
     elif not restored_mp4.exists():
         t0 = time.monotonic()
-        seedvr_kwargs = {"res_h": H, "res_w": W, "sp_size": sp_size, "seed": 666}
+        seedvr_kwargs = {"res_h": seedvr_res_h, "res_w": seedvr_res_w,
+                         "sp_size": sp_size, "seed": 666}
+        print(f"  [E] SeedVR res_h={seedvr_res_h} res_w={seedvr_res_w} "
+              f"(orig {W}x{H}, max_area={max_area})")
         if seedvr_kwargs_extra:
             seedvr_kwargs.update(seedvr_kwargs_extra)
         Recover(
@@ -485,16 +528,15 @@ def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
               f"in {timings['yolo_restored']}s")
 
     # Step G: mIoU
-    # 检查 restored 视频尺寸（SeedVR 可能有像素对齐 crop）
+    # 检查 restored 视频尺寸（SeedVR 内部 NaResize+DivisibleCrop(16, center) 可能改尺寸）
     if pred_restored is not None:
         W_r, H_r, _, nb_r = probe_video(restored_mp4)
         if (W_r, H_r) != (W, H):
+            # SeedVR max_area = res_h * res_w，取自 process_video 里实际生效的 effective_max_area
             print(f"  [G] restored 尺寸变化 {W}x{H} → {W_r}x{H_r}，"
-                  f"按比例映回 GT 空间")
-            sx, sy = W / W_r, H / H_r
-            pred_restored_scaled = [
-                [[x1 * sx, y1 * sy, x2 * sx, y2 * sy] for (x1, y1, x2, y2) in fr]
-                for fr in pred_restored]
+                  f"逆向 NaResize+DivisibleCrop(center) 映回 GT 空间 (max_area={effective_max_area})")
+            pred_restored_scaled = restored_to_orig_boxes(
+                pred_restored, W, H, W_r, H_r, effective_max_area)
         else:
             pred_restored_scaled = pred_restored
     else:
@@ -571,6 +613,9 @@ def main():
                     help="子目录 tag；默认 q{q_roi}_{q_bg}。out/tag/<video>/ ...")
     ap.add_argument("--skip_seedvr", action="store_true",
                     help="只跑压缩，不跑 SeedVR 修复")
+    ap.add_argument("--max_area", type=int, default=720 * 1280,
+                    help="SeedVR 目标像素面积上限；H*W ≤ max_area 保留原分辨率，"
+                         "H*W > max_area 时等比缩到 max_area（保持长宽比）")
     args = ap.parse_args()
     if args.tag is None:
         args.tag = f"q{args.q_roi}_{args.q_bg}"
@@ -611,7 +656,8 @@ def main():
             meta = process_video(mp4, txt, out_dir, work_dir, args.device,
                                  yolo_model, sp_size=args.sp_size,
                                  q_roi=args.q_roi, q_bg=args.q_bg,
-                                 skip_seedvr=args.skip_seedvr)
+                                 skip_seedvr=args.skip_seedvr,
+                                 max_area=args.max_area)
             meta["subset"] = subset
             all_meta.append(meta)
         except Exception as e:
