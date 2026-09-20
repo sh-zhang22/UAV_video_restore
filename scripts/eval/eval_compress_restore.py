@@ -481,8 +481,18 @@ def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
         t0 = time.monotonic()
         seedvr_kwargs = {"res_h": seedvr_res_h, "res_w": seedvr_res_w,
                          "sp_size": sp_size, "seed": 666}
-        print(f"  [E] SeedVR res_h={seedvr_res_h} res_w={seedvr_res_w} "
-              f"(orig {W}x{H}, max_area={max_area})")
+        # 长视频分块推理：目标每段 T×A ≤ 1.2e8（约 79 GB 显存的 65% 余量）
+        # 129 帧 × 921600 = 1.19e8，与已验证成功点 (T=308, A=518400, T×A=1.6e8) 同量级但更保守
+        _seg_ta_budget = 1.2e8
+        _seg_frames = max(9, int(_seg_ta_budget / effective_max_area))
+        _seg_frames = ((_seg_frames - 1) // 4) * 4 + 1  # 对齐到 4k+1
+        if nb > _seg_frames:
+            seedvr_kwargs["chunk_frames"] = _seg_frames
+            print(f"  [E] SeedVR res_h={seedvr_res_h} res_w={seedvr_res_w} "
+                  f"(orig {W}x{H}, max_area={max_area}) chunk={_seg_frames}f (T={nb})")
+        else:
+            print(f"  [E] SeedVR res_h={seedvr_res_h} res_w={seedvr_res_w} "
+                  f"(orig {W}x{H}, max_area={max_area}) 单段 (T={nb} ≤ {_seg_frames})")
         if seedvr_kwargs_extra:
             seedvr_kwargs.update(seedvr_kwargs_extra)
         Recover(

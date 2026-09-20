@@ -185,6 +185,7 @@ def _run_one_video(
     sp_size: int,
     out_fps,
     cond_noise_scale: float,
+    chunk_frames: int = 0,
 ):
     import mediapy
     from einops import rearrange
@@ -223,33 +224,63 @@ def _run_one_video(
         Normalize(0.5, 0.5),
         Rearrange("t c h w -> c t h w"),
     ])
-    cond_latent = transform(video.to(get_device()))
-    ori_length = cond_latent.size(1)
-    input_video = cond_latent
-    cond_latent = _cut_videos(cond_latent, sp_size)
+    cond_full = transform(video.to(get_device()))  # (C, T, H, W)
+    T_full = cond_full.size(1)
 
-    runner.dit.to("cpu")
-    runner.vae.to(get_device())
-    cond_latents = runner.vae_encode([cond_latent])
-    runner.vae.to("cpu")
-    runner.dit.to(get_device())
+    # ---- 分块策略：chunk_frames > 0 且 T_full > chunk_frames 时按段循环推理 ----
+    # 每段独立走：VAE encode → DiT inference → wavelet color_fix → 收集到 CPU
+    # 边界不做重叠 blend（SeedVR2 单步 sr 任务，帧间独立性高）
+    if chunk_frames and T_full > chunk_frames:
+        # 让每段帧数满足 (t-1) % 4 == 0（避免 _cut_videos 内部 pad）
+        step = ((chunk_frames - 1) // 4) * 4 + 1
+        chunk_starts = list(range(0, T_full, step))
+        print(f"[chunk] T={T_full}, chunk={step}, segments={len(chunk_starts)} "
+              f"({[min(step, T_full - s) for s in chunk_starts]})")
+    else:
+        chunk_starts = [0]
+        step = T_full
 
-    samples = _generation_step(runner, text_embeds, cond_latents, cond_noise_scale)
-    runner.dit.to("cpu")
+    samples_all = []  # CPU 上的 (t_i, C, H, W) 张量列表
+    inputs_all = []   # 对应的 orig 输入（用于 colorfix 参考）
+
+    for seg_idx, s0 in enumerate(chunk_starts):
+        s1 = min(s0 + step, T_full)
+        seg = cond_full[:, s0:s1]           # (C, t_i, H, W)
+        seg_len = seg.size(1)
+        seg_padded = _cut_videos(seg, sp_size)
+
+        runner.dit.to("cpu")
+        runner.vae.to(get_device())
+        cond_latents = runner.vae_encode([seg_padded])
+        runner.vae.to("cpu")
+        runner.dit.to(get_device())
+
+        if len(chunk_starts) > 1:
+            print(f"[chunk] seg {seg_idx+1}/{len(chunk_starts)}: frames {s0}:{s1} (len={seg_len})")
+
+        samples = _generation_step(runner, text_embeds, cond_latents, cond_noise_scale)
+        runner.dit.to("cpu")
+        gc.collect(); torch.cuda.empty_cache()
+
+        if get_sequence_parallel_rank() != 0:
+            del samples, cond_latents, seg_padded
+            continue
+
+        sample = samples[0]
+        if seg_len < sample.shape[0]:
+            sample = sample[:seg_len]
+        inp = rearrange(seg[:, None] if seg.ndim == 3 else seg, "c t h w -> t c h w")
+        if use_colorfix:
+            sample = wavelet_reconstruction(sample.to("cpu"), inp[: sample.size(0)].to("cpu"))
+        else:
+            sample = sample.to("cpu")
+        samples_all.append(sample)
+        del samples, cond_latents, seg_padded, seg, inp
 
     if get_sequence_parallel_rank() != 0:
         return
 
-    sample = samples[0]
-    if ori_length < sample.shape[0]:
-        sample = sample[:ori_length]
-    inp = (
-        rearrange(input_video[:, None] if input_video.ndim == 3 else input_video, "c t h w -> t c h w")
-    )
-    if use_colorfix:
-        sample = wavelet_reconstruction(sample.to("cpu"), inp[: sample.size(0)].to("cpu"))
-    else:
-        sample = sample.to("cpu")
+    sample = torch.cat(samples_all, dim=0)  # (T_full, C, H, W)
     sample = rearrange(sample[:, None] if sample.ndim == 3 else sample, "t c h w -> t h w c")
     sample = sample.clip(-1, 1).mul_(0.5).add_(0.5).mul_(255).round().to(torch.uint8).numpy()
 
@@ -597,6 +628,8 @@ def main():
     parser.add_argument("--sample_steps", type=int, default=None)
     parser.add_argument("--cond_noise_scale", type=float, default=None)
     parser.add_argument("--out_fps", type=float, default=None)
+    parser.add_argument("--chunk_frames", type=int, default=0,
+                        help="按帧数分段推理；0=不分段（原行为）。段长会取整到最近的 4k+1")
     # seedvr2_3b_ctrl 专用参数（其它 variant 不会传，全部 default=None/False）
     parser.add_argument("--mask_path", default=None)
     parser.add_argument("--lora_ckpt", default=None)
@@ -779,6 +812,7 @@ def main():
             sp_size=args.sp_size,
             out_fps=args.out_fps,
             cond_noise_scale=cond_noise_scale,
+            chunk_frames=args.chunk_frames,
         )
 
     dev = torch.cuda.current_device()

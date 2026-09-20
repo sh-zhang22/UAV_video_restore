@@ -94,7 +94,8 @@ def run_seedvr(
             "--seed", str(method_kwargs.get("seed", 666)),
             "--cfg_rescale", str(method_kwargs.get("cfg_rescale", 0.0)),
         ]
-        for opt_key in ("cfg_scale", "sample_steps", "cond_noise_scale", "out_fps"):
+        for opt_key in ("cfg_scale", "sample_steps", "cond_noise_scale", "out_fps",
+                        "chunk_frames"):
             if method_kwargs.get(opt_key) is not None:
                 cmd += [f"--{opt_key}", str(method_kwargs[opt_key])]
 
