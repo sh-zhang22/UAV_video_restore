@@ -50,13 +50,11 @@ UAV_video_repair/
 │   │   ├── build_uitadrone_trainpairs.py   # UITAdrone 同上
 │   │   └── make_mask_from_video.py         # YOLO → mask.mp4
 │   ├── eval/
-│   │   ├── eval_yolo_visdrone.py           # baseline YOLO 检测 mIoU
-│   │   ├── eval_yolo_visdrone_track.py     # + ByteTrack
-│   │   ├── eval_yolo_visdrone_track_interp.py  # + 时序插值补齐（推荐流水线）
-│   │   ├── sweep_track_params.py           # 参数扫描
-│   │   ├── eval_compress_restore.py        # 压缩+修复端到端评估
-│   │   ├── evaluate.py                     # PSNR/SSIM/LPIPS/mIoU 单跑
-│   │   └── test_evaluate.py                # metrics 冒烟
+│   │   ├── eval_yolo_visdrone.py           # baseline YOLO mIoU + 共享常量/工具（ROOT/load_gt/…）
+│   │   ├── eval_compress_restore.py        # 压缩+修复端到端评估（YOLO track+interp 已内联）
+│   │   ├── compute_pixel_metrics.py        # 批量 PSNR/SSIM/LPIPS（薄壳 → metrics.Evaluator）
+│   │   ├── compute_bbox_miou.py            # 批量 bbox 匹配式 mIoU（min_side=32 默认）
+│   │   └── test_evaluator.py               # metrics.Evaluator 冒烟（10 项）
 │   ├── vis/
 │   │   ├── visualize_yolo_visdrone.py      # 单栏：pred+GT
 │   │   ├── visualize_yolo_visdrone_track.py# + 时序插值（青色 = interp 补齐）
@@ -302,8 +300,7 @@ YOLO v9e/best.pt + imgsz=960 + conf=0.15 + tracker=bytetrack_loose.yaml
 
 **修复**：所有做 track+predict 双 pass 的脚本，都统一 **track 在前、predict 在后**：
 
-- `scripts/eval/eval_yolo_visdrone_track_interp.py`
-- `scripts/eval/eval_compress_restore.py`
+- `scripts/eval/eval_compress_restore.py::yolo_track_interp_mp4`（推荐流水线现在内联在这里）
 - `scripts/vis/visualize_yolo_visdrone_track.py`
 
 **代码模板**（若要新写检测评估脚本，务必抄这个顺序）：
@@ -322,7 +319,7 @@ for r in model.predict(str(mp4), stream=True, ...):
 
 ### 5.4 常用命令
 
-**baseline 检测评估**（无 tracker）：
+**baseline 检测评估**（无 tracker，独立跑 orig 视频的 YOLO mIoU）：
 
 ```bash
 python scripts/eval/eval_yolo_visdrone.py \
@@ -330,22 +327,7 @@ python scripts/eval/eval_yolo_visdrone.py \
     --device cuda:0 --out_dir eval_baseline
 ```
 
-**track + interp（推荐流水线）**：
-
-```bash
-python scripts/eval/eval_yolo_visdrone_track_interp.py \
-    --model ckpts_yolo/v9e/best.pt --imgsz 960 --conf 0.15 \
-    --tracker trackers/bytetrack_loose.yaml \
-    --max_gap 4 --min_track_len 5 \
-    --device cuda:0 --out_dir eval_recommended
-```
-
-**扫参**（v6 sweep 模式，一次跑多组）：
-
-```bash
-python scripts/eval/sweep_track_params.py --device cuda:0
-# 结果 → eval_v6_sweep/{tag}/summary.json + leaderboard.csv
-```
+**推荐流水线（track + interp）** 已内联到 `eval_compress_restore.py::yolo_track_interp_mp4`，正常跑压缩-修复端到端评估就会用到；默认参数（`conf=0.15, tracker=bytetrack_loose.yaml, max_gap=4, min_track_len=5`）是 v6 sweep 的最优值。
 
 **可视化叠框**（生成带 pred 绿框 + GT 红框 + HUD 的 mp4）：
 
@@ -355,54 +337,39 @@ python scripts/vis/visualize_yolo_visdrone_track.py \
 # 输出 → vis_analysis/debug/M01_test-dev_uav0000306_00230_v_full.mp4
 ```
 
-### 5.5 3-QP 压缩-修复端到端验证
+### 5.5 压缩-修复端到端验证（q22_37，10 个 test-dev 视频）
 
-`scripts/eval/eval_compress_restore.py` 串起完整链路：**clean video → dual-QP VVenC 编码 (ROI 高质量 + 背景低质量) → SeedVR2-3B 修复 → 三路视频各自过 YOLO 流水线**，输出五个 mIoU：`orig/GT`、`compressed/GT`、`restored/GT`、`compressed/orig`、`restored/orig`（后两个衡量"相对原始视频损失了多少信息"）。
+`scripts/eval/eval_compress_restore.py` 串起完整链路：**clean video → dual-QP VVenC 编码 (ROI 高质量 + 背景低质量) → SeedVR2-3B 修复 → 三路视频各自过 YOLO 流水线**，输出五个 mask-mIoU：`orig/GT`、`compressed/GT`、`restored/GT`、`compressed/orig`、`restored/orig`（后两个衡量"相对原始视频损失了多少信息"）。
 
-**在 uav0000306 上跑的 3 组 QP**（`eval_compress_restore/{q17_27,q22_37,q22_46}/`）：
+`Q_ROI=22 / Q_BG=37` 在 10 个 test-dev 视频上的均值（`eval_compress_restore/q22_37/`）：
 
-| tag    | Q_ROI | Q_BG | orig/GT | cmp/GT | rst/GT | cmp/orig | rst/orig |
-|--------|-------|------|---------|--------|--------|----------|----------|
-| q17_27 | 17    | 27   | 0.6209  | 0.6182 | 0.5820 | **0.9267** | 0.6733 |
-| q22_37 | 22    | 37   | 0.6209  | 0.6164 | 0.5887 | 0.9020   | 0.6765 |
-| q22_46 | 22    | 46   | 0.6209  | 0.6108 | 0.5795 | 0.8850   | 0.6649 |
+| 指标                | orig/GT | cmp/GT | rst/GT | cmp/orig | rst/orig |
+|---------------------|---------|--------|--------|----------|----------|
+| **mask-mIoU**       | 0.6878  | 0.6864 | 0.6817 | 0.9174   | 0.8324   |
 
-**观察**：QP 越激进（Q_BG 越大）→ 压缩后 mIoU 掉得越多、修复后 mIoU 也略降；但**所有 QP 下 rst/orig 都稳定在 0.66-0.68**，说明修复自身有一个恒定的~33% 信息损失，与压缩强度无关，指向下面 §5.6 的亚像素漂移问题。
+配套像素/目标级指标（`metrics_all.csv`）：
+
+| 指标        | compressed vs orig | restored vs orig |
+|-------------|--------------------|--------------------|
+| PSNR ↑      | 30.87              | 20.70              |
+| SSIM ↑      | 0.881              | 0.638              |
+| LPIPS ↓     | 0.176              | 0.254              |
+| bbox-mIoU ↑ | 0.925              | 0.826              |
+
+**观察**：SeedVR2-3B 修复在**所有 5 个指标上都比压缩输入更差**（方向一致）。原因不是漏检/虚警，而是修复自身的亚像素漂移（见 §5.6）。
 
 ### 5.6 修复自身的失真诊断（亚像素漂移）
 
-肉眼看 `restored` 与 `orig` 几乎一致，但 mIoU 从 0.62 掉到 0.42-0.44。用 Hungarian 匹配把两侧 boxes 逐帧配对分析后：
+肉眼看 `restored` 与 `orig` 几乎一致，但 mIoU 从 0.62 掉到 0.42-0.44。Hungarian 匹配分析结论：71% 的"漏检"框在 10 像素内都能在 `restored` 侧找到对应框，说明**不是漏检也不是虚警**，而是 box 中心相对 `orig` 有 **2-3 像素 std** 的系统性偏移；小物体（<200 px²）代价最大，IoU=0.5 阈值下 recall 只有 25.7%。**根因猜想**：SeedVR 8× 空间下采 → 采样不确定性 → 8× 上采回像素域时的位置漂移。分析工具：`scripts/vis/visualize_compress_restore_diff.py`。
 
-- **不是漏检也不是虚警**：71% 的"漏检"框在 10 像素内都能找到 `restored` 侧的对应"虚警"框
-- **是系统性亚像素漂移**：`restored` 的 box 中心相对 `orig` 有 **2-3 像素的 std 偏移**
-- **小物体（<200 px²）代价最大**：这类目标在 IoU=0.5 阈值下 recall 只有 **25.7%**，因为 2-3 px 偏移已经把 IoU 拉到 0.5 以下
+### 5.7 可视化脚本
 
-**根因猜想**：SeedVR 是 latent diffusion，8× 空间下采 → 采样步不确定性 → 8× 上采回像素域时轻微位置漂移。这也解释了为什么 `cmp/orig` 到 0.9 而 `rst/orig` 只到 0.67：压缩是**块级**失真（DCT/CTU 网格对齐，box 边界不会漂），修复是**空间坐标**失真。
-
-**分析工具**：`scripts/vis/visualize_compress_restore_diff.py` 可以逐帧标出 keep / hallucinate / miss（详见 §5.7）。
-
-### 5.7 三种可视化方式
-
-以 `q22_37` 的实验结果为例：
-
-**4 宫格全景**（orig+GT/cmp+GT/rst+GT/mask）：
-
-```bash
-python scripts/vis/visualize_compress_restore.py --tag q22_37
-```
-
-**3 宫格 diff**（keep=绿 / hallucinate=红 / miss=黄虚线；一眼看出漂移问题）：
-
-```bash
-python scripts/vis/visualize_compress_restore_diff.py --tag q22_46
-```
-
-**3 宫格 triple**（orig | cmp+orig-red | rst+orig-red，颜色对比看修复保真度）：
-
-```bash
-python scripts/vis/visualize_compress_restore_triple.py --tag q22_37 \
-    --videos test-dev_uav0000306_00230_v_full
-```
+| 视图              | 命令 |
+|-------------------|------|
+| YOLO 检测叠框     | `python scripts/vis/visualize_yolo_visdrone_track.py --tag <tag>` |
+| 4 宫格 orig/cmp/rst/mask | `python scripts/vis/visualize_compress_restore.py --tag q22_37` |
+| 3 宫格 diff (keep/hallucinate/miss) | `python scripts/vis/visualize_compress_restore_diff.py --tag q22_37` |
+| 3 宫格 triple 对比 | `python scripts/vis/visualize_compress_restore_triple.py --tag q22_37` |
 
 ---
 
@@ -506,65 +473,89 @@ RES_H=720 RES_W=960 CUDA_VISIBLE_DEVICES=1 bash run_seedvr2_3b.sh
 
 ---
 
-## 8. 评估指标模块（`metrics/` + `scripts/eval/evaluate.py`）
+## 8. 评估指标模块（`metrics/Evaluator`）
 
-修复完成后，对 (pred, gt) 视频对一次算出 **PSNR / SSIM / LPIPS / mIoU**。
+统一评测器，一次加载 ref → 复用给多个 candidate → 一并算 **PSNR / SSIM / LPIPS / mIoU / bbox-mIoU**。
 
-### 8.1 四个指标
+### 8.1 五个指标
 
-| 指标  | 层次       | 越大越好 | 完美值 | 敏感于           | 我们的成本 |
-|-------|-----------|----------|--------|------------------|-----------|
-| PSNR  | 像素      | ✓        | ∞      | 像素级 L2        | CPU 秒级 |
-| SSIM  | 局部结构  | ✓        | 1      | 亮度/对比度/纹理 | GPU 秒级 |
-| LPIPS | 学习感知  | ✗        | 0      | 视觉感知差异     | GPU 数秒（首次下 AlexNet 233MB） |
-| mIoU  | 语义分割  | ✓        | 1      | ROI 位置形状     | GPU 数秒（首次下 YOLOv8n 6MB） |
+| 指标            | 层次       | 越大越好 | 完美值 | 敏感于           | 我们的成本 |
+|-----------------|-----------|----------|--------|------------------|-----------|
+| PSNR            | 像素      | ✓        | ∞      | 像素级 L2        | CPU 秒级 |
+| SSIM            | 局部结构  | ✓        | 1      | 亮度/对比度/纹理 | GPU 秒级（chunked 防 int32 溢出） |
+| LPIPS           | 学习感知  | ✗        | 0      | 视觉感知差异     | GPU 数秒（首次下 AlexNet 233MB） |
+| mIoU (mask)     | 语义分割  | ✓        | 1      | ROI 位置形状     | CPU 秒级 |
+| **mIoU (bbox)** | 目标检测  | ✓        | 1      | 目标级一致性     | CPU 秒级 |
 
-**mIoU 语义**：修复后视频里的关键物体，位置和形状是否还被 YOLO 认得出。**约束**：pred 和 gt 必须等 shape（帧数 + 分辨率），否则 raise，**不做自动 resize**（silent bug 源头）。
+**bbox-mIoU（松弛版，默认）**：每帧对 pred × ref 做 IoU 最大化一对一匹配（greedy/hungarian）；漏检 IoU=0（惩罚）；误检丢弃（不惩罚）；`min_side < 32` 的小目标双向剔除；micro-average。见 `metrics.miou.miou_bbox_match`。
 
-### 8.2 常用命令
+**约束**：cand 与 ref 帧数不一致 → 取 min(T) 前对齐；分辨率不一致 → 默认 `resize_mode="ref"`，cand bicubic+antialias 缩到 ref。
 
-```bash
-# 一次算全部（无 gt_mask → 现场 YOLO 生成 pred_mask / gt_mask）
-python scripts/eval/evaluate.py --pred pred.mp4 --gt gt.mp4 --device cuda:0
-
-# 只算 PSNR/SSIM
-python scripts/eval/evaluate.py --pred pred.mp4 --gt gt.mp4 --which psnr ssim
-
-# 外部传 mask（避开 YOLO 的随机性，最严格）
-python scripts/eval/evaluate.py --pred pred.mp4 --gt gt.mp4 \
-    --pred_mask pm.mp4 --gt_mask gm.mp4
-
-# 只关心特定类别的 mIoU
-python scripts/eval/evaluate.py --pred pred.mp4 --gt gt.mp4 \
-    --yolo_classes person car truck
-```
-
-### 8.3 Python API
+### 8.2 Python API
 
 ```python
-from scripts.eval.evaluate import evaluate
+from metrics import Evaluator
+ev = Evaluator(device="cuda:0", lpips_net="alex")
 
-scores = evaluate(
-    pred_video="test_recovered_seedvr2_3b.mp4",
-    gt_video="test.mp4",
-    device="cuda:0",
-    yolo_classes=["person", "car"],
-    which=("psnr", "ssim", "lpips", "miou"),
+# 单次评测：一份 ref，多个 cand 复用
+res = ev.evaluate(
+    ref="orig.mp4",
+    cands={"cmp": "compressed.mp4", "rst": "restored.mp4"},
+    which=("psnr", "ssim", "lpips"),
 )
-# scores = {'psnr': 21.4, 'ssim': 0.68, 'lpips': 0.39, 'miou': 0.12}
+# res = {"cmp": {"psnr": ..., "ssim": ..., "lpips": ...}, "rst": {...}}
+
+# bbox-mIoU（pred/ref 都是 per-frame xyxy list；默认 min_side=32、greedy）
+r = Evaluator.miou_bbox_match(pred_frames, ref_frames)
+# r = {"miou", "n_matched", "n_missed", "n_ref_kept", ...}
+
+# 批量扫目录（对 eval_compress_restore/<tag>/<video>/ 结构）
+summary = ev.evaluate_folder(
+    tag_dir="eval_compress_restore/q22_37",
+    ref_lookup=find_orig_mp4,
+    cand_names={"cmp": "compressed.mp4", "rst": "restored.mp4"},
+    which=("psnr", "ssim", "lpips"),
+    out_csv="metrics_pixel.csv", out_json="metrics_pixel.json",
+)
+```
+
+### 8.3 常用命令
+
+```bash
+# 批量像素指标（PSNR/SSIM/LPIPS）→ <tag>/metrics_pixel.{csv,json}
+python scripts/eval/compute_pixel_metrics.py --tag q22_37 --device cuda:0
+
+# 批量 bbox-mIoU（cmp/orig 与 rst/orig，min_side=32 默认）→ <tag>/metrics_bbox_miou.{csv,json}
+python scripts/eval/compute_bbox_miou.py --tag q22_37
+# 想看纯目标检测（不过滤小目标）：--min_side 0
+```
+
+**合并成一张 `metrics_all.csv`**（把 pixel + bbox 按 `video` 拼在一起，便于比较）：
+
+```python
+import csv, pathlib
+tag = pathlib.Path("eval_compress_restore/q22_37")
+pix = {r["video"]: r for r in csv.DictReader(open(tag / "metrics_pixel.csv"))}
+box = {r["video"]: r for r in csv.DictReader(open(tag / "metrics_bbox_miou.csv"))}
+rows = []
+for v in sorted(pix):
+    r = {"video": v, **{k: pix[v][k] for k in
+         ("T","W_o","H_o","W_r","H_r","cmp_psnr","cmp_ssim","cmp_lpips",
+          "rst_psnr","rst_ssim","rst_lpips")}}
+    r["cmp_bbox_miou"] = box[v]["cmp_miou"]
+    r["rst_bbox_miou"] = box[v]["rst_miou"]
+    rows.append(r)
+with open(tag / "metrics_all.csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
 ```
 
 ### 8.4 冒烟测试
 
 ```bash
-python scripts/eval/test_evaluate.py --device cuda:0
+python scripts/eval/test_evaluator.py --device cuda:0
 ```
 
-四层子测试（都必须过）：
-1. **自我一致性**：pred = gt = `test.mp4` → PSNR≈inf, SSIM≈1, LPIPS≈0
-2. **加 σ=0.01 高斯噪声**：所有指标向"变差"方向偏
-3. **mIoU 自我一致性**：同一视频过 YOLO 两次 → mIoU=1（YOLO 确定性）
-4. **真实对比**：`test_recovered_seedvr2_3b.mp4` vs `test.mp4`，数值合理性
+10 项子测试（都必须过）：self-consistency / small-noise / multi-cand consistency / resize-mode / folder-matches-old / mIoU-from-boxes / bbox-match identity·missing-and-extra·small-filter / hungarian≥greedy。
 
 ### 8.5 新增依赖
 
@@ -572,7 +563,7 @@ python scripts/eval/test_evaluate.py --device cuda:0
 
 ```bash
 conda activate seedvr
-pip install lpips torchmetrics
+pip install lpips torchmetrics scipy
 ```
 
 ---
@@ -585,16 +576,16 @@ pip install lpips torchmetrics
 |-----------------------------------|--------------------------------------------------------------------------------------------|
 | baseline 修复                     | `python test_recover_seedvr2_3b.py`                                                        |
 | SeedVR2-7B 多卡修复               | `python test_recover_seedvr2_7b.py`（内部 sp_size=2）                                       |
-| VisDrone 检测 mIoU（推荐流水线）  | `python scripts/eval/eval_yolo_visdrone_track_interp.py`                                   |
-| YOLO 参数扫描                     | `python scripts/eval/sweep_track_params.py`                                                |
+| VisDrone baseline 检测 mIoU       | `python scripts/eval/eval_yolo_visdrone.py --model ckpts_yolo/v9e/best.pt`                 |
 | 3-QP 压缩-修复端到端评估          | `python scripts/eval/eval_compress_restore.py --Q_ROI 22 --Q_BG 37`                        |
+| 批量像素指标（PSNR/SSIM/LPIPS）   | `python scripts/eval/compute_pixel_metrics.py --tag q22_37`                                |
+| 批量 bbox-mIoU（min_side=32）     | `python scripts/eval/compute_bbox_miou.py --tag q22_37`                                    |
 | 生成 mask 用于 ctrl variant       | `python scripts/data/make_mask_from_video.py --in_video X.mp4 --out_mask mask.mp4`         |
 | ctrl variant 推理                 | `python scripts/train/test_recover_seedvr2_3b_ctrl.py --mask_path mask.mp4`                |
 | ctrlnet variant 推理              | `python scripts/train/test_recover_seedvr2_3b_ctrlnet.py --mask_path mask.mp4`             |
 | 学生 20 层推理                    | `python scripts/train/test_recover_seedvr2_3b_student.py`                                  |
 | 检测结果可视化（含插值补齐）      | `python scripts/vis/visualize_yolo_visdrone_track.py --tag mytag`                          |
 | 压缩-修复 diff 可视化             | `python scripts/vis/visualize_compress_restore_diff.py --tag q22_37`                       |
-| PSNR/SSIM/LPIPS/mIoU 单跑         | `python scripts/eval/evaluate.py --pred X.mp4 --gt Y.mp4`                                  |
-| metrics 冒烟                      | `python scripts/eval/test_evaluate.py`                                                      |
+| metrics 冒烟                      | `python scripts/eval/test_evaluator.py`                                                     |
 
-**日志/中间产物默认目录**：`eval_v6_sweep/` `eval_v7_imgsz/` `eval_compress_restore/` `vis_analysis/` `vis_compress_restore/` `vis_compress_restore_diff/` `runs_ctrl/` `runs_ctrlnet/` `runs_distill/`。这些都在 `.gitignore` 里，不入库。
+**日志/中间产物默认目录**：`eval_baseline/` `eval_compress_restore/` `vis_compress_restore/` `vis_compress_restore_diff/` `runs_ctrl/` `runs_ctrlnet/` `runs_distill/`。这些都在 `.gitignore` 里，不入库。

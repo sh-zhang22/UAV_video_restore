@@ -219,7 +219,7 @@ def main():
     ap.add_argument("--tracker", default="trackers/bytetrack_loose.yaml")
     ap.add_argument("--max_gap", type=int, default=4)
     ap.add_argument("--min_track_len", type=int, default=5,
-                    help="track 至少出现 N 次才参与插值（同 eval_yolo_visdrone_track_interp）")
+                    help="track 至少出现 N 次才参与插值")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out_dir", type=Path, default=Path("vis_analysis"))
     ap.add_argument("--tag", default="v9e_bt_loose_gap8_conf02")

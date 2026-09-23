@@ -53,7 +53,7 @@ MASK_SIGMA = 3.0
 YOLO_MODEL = "ckpts_yolo/v9e/best.pt"
 YOLO_CONF = 0.15   # 2026-09-15 v6 sweep 最优 conf
 YOLO_IMGSZ = 960
-# 时序管线（与 eval_yolo_visdrone_track_interp 默认一致，2026-09-15 v6 sweep）
+# 时序管线（2026-09-15 v6 sweep 得出的最优参数）
 TRACKER = "trackers/bytetrack_loose.yaml"
 MAX_GAP = 4
 MIN_TRACK_LEN = 5
@@ -149,7 +149,7 @@ def yolo_detect_mp4(mp4, model, device, n_frames_expected=None):
 
 def yolo_track_interp_mp4(mp4, model, device, n_frames_expected=None):
     """新推荐管线：YOLO v9e + ByteTrack + gap 插值，返回 per-frame [[x1,y1,x2,y2], ...]。
-    与 eval_yolo_visdrone_track_interp.py::eval_one_video_track_interp 的检测逻辑对齐。"""
+    Hybrid：track 收 track_history → predict 拿每帧原始 boxes → gap 线性插值补齐。"""
     # Pass 1: track → track_history（用于 gap 插值，只需要坐标+tid）
     # ★ track 必须放在 predict 前面：ultralytics 的 predictor 内部状态在首次调用后固化，
     #   若首次是 predict，后续 predict 的 NMS/fp16 配置与 track-warmed 状态不同，
@@ -375,7 +375,8 @@ def compute_miou_pred_pred(pred_a, pred_b, W, H):
 def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
                   yolo_model, sp_size=1, seedvr_kwargs_extra=None,
                   q_roi=Q_ROI, q_bg=Q_BG, skip_seedvr=False,
-                  max_area=None):
+                  max_area=None,
+                  method="seedvr2_3b", ckpt_seedvr=None, seg_ta_budget=1.2e8):
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -481,9 +482,10 @@ def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
         t0 = time.monotonic()
         seedvr_kwargs = {"res_h": seedvr_res_h, "res_w": seedvr_res_w,
                          "sp_size": sp_size, "seed": 666}
-        # 长视频分块推理：目标每段 T×A ≤ 1.2e8（约 79 GB 显存的 65% 余量）
+        # 长视频分块推理：目标每段 T×A ≤ seg_ta_budget（3B 默认 1.2e8 ~ 79 GB 65%）
         # 129 帧 × 921600 = 1.19e8，与已验证成功点 (T=308, A=518400, T×A=1.6e8) 同量级但更保守
-        _seg_ta_budget = 1.2e8
+        # 7B 显存吃更多，建议传入 seg_ta_budget=5e7 或用 sp_size=2 双卡
+        _seg_ta_budget = seg_ta_budget
         _seg_frames = max(9, int(_seg_ta_budget / effective_max_area))
         _seg_frames = ((_seg_frames - 1) // 4) * 4 + 1  # 对齐到 4k+1
         if nb > _seg_frames:
@@ -495,16 +497,17 @@ def process_video(mp4_orig, gt_txt, out_dir, work_dir, device,
                   f"(orig {W}x{H}, max_area={max_area}) 单段 (T={nb} ≤ {_seg_frames})")
         if seedvr_kwargs_extra:
             seedvr_kwargs.update(seedvr_kwargs_extra)
+        _ckpt = ckpt_seedvr if ckpt_seedvr is not None else str(CKPT_SEEDVR)
         Recover(
             video_path=str(compressed_mp4),
             recovered_path=str(restored_mp4),
-            ckpt_path=str(CKPT_SEEDVR),
-            method="seedvr2_3b",
+            ckpt_path=_ckpt,
+            method=method,
             device=device,
             method_kwargs=seedvr_kwargs,
         )
         timings["seedvr"] = round(time.monotonic() - t0, 2)
-        print(f"  [E] seedvr2_3b: {timings['seedvr']}s")
+        print(f"  [E] {method}: {timings['seedvr']}s")
     else:
         print(f"  [E] restored.mp4 cached")
 
@@ -626,9 +629,31 @@ def main():
     ap.add_argument("--max_area", type=int, default=720 * 1280,
                     help="SeedVR 目标像素面积上限；H*W ≤ max_area 保留原分辨率，"
                          "H*W > max_area 时等比缩到 max_area（保持长宽比）")
+    ap.add_argument("--method", default="seedvr2_3b",
+                    choices=["seedvr2_3b", "seedvr2_7b"],
+                    help="SeedVR variant；7B 显存更吃紧，建议 sp_size=2 双卡或降 seg_ta_budget")
+    ap.add_argument("--ckpt_seedvr", default=None,
+                    help="SeedVR DiT ckpt 路径；不给则按 method 自动选 ckpts/seedvr2_ema_{3b,7b}.pth")
+    ap.add_argument("--seg_ta_budget", type=float, default=None,
+                    help="分块 T*A 预算；不给则 3B=1.2e8, 7B=5e7")
     args = ap.parse_args()
+    # 按 method 自动补默认 ckpt / seg_ta_budget
+    if args.ckpt_seedvr is None:
+        _ckpt_map = {
+            "seedvr2_3b": _PROJ_ROOT / "third_party/SeedVR/ckpts/seedvr2_ema_3b.pth",
+            "seedvr2_7b": _PROJ_ROOT / "third_party/SeedVR/ckpts/seedvr2_ema_7b.pth",
+        }
+        args.ckpt_seedvr = str(_ckpt_map[args.method])
+    if args.seg_ta_budget is None:
+        args.seg_ta_budget = {"seedvr2_3b": 1.2e8, "seedvr2_7b": 5e7}[args.method]
+    # 3B 保持原 tag `q{qroi}_{qbg}`（兼容已有 workflow）；
+    # 非 3B（如 7B）默认加 method 后缀，避免覆盖已有 3B 结果
     if args.tag is None:
-        args.tag = f"q{args.q_roi}_{args.q_bg}"
+        if args.method == "seedvr2_3b":
+            args.tag = f"q{args.q_roi}_{args.q_bg}"
+        else:
+            _method_tag = args.method.split("_")[-1]  # seedvr2_7b → 7b
+            args.tag = f"q{args.q_roi}_{args.q_bg}_{_method_tag}"
 
     # 收集视频（视频用干净版，GT txt 从 boxed/ 读）
     videos = []
@@ -643,8 +668,9 @@ def main():
         videos = videos[:args.limit]
     if not videos:
         raise SystemExit("no videos matched")
-    print(f"[plan] {len(videos)} videos, device={args.device}, "
-          f"Q_ROI={args.q_roi}, Q_BG={args.q_bg}, tag={args.tag}")
+    print(f"[plan] {len(videos)} videos, device={args.device}, sp_size={args.sp_size}, "
+          f"Q_ROI={args.q_roi}, Q_BG={args.q_bg}, tag={args.tag}, "
+          f"method={args.method}, seg_ta_budget={args.seg_ta_budget:.1e}")
 
     out_base = args.out / args.tag
     work_base = args.work_root / args.tag
@@ -667,7 +693,10 @@ def main():
                                  yolo_model, sp_size=args.sp_size,
                                  q_roi=args.q_roi, q_bg=args.q_bg,
                                  skip_seedvr=args.skip_seedvr,
-                                 max_area=args.max_area)
+                                 max_area=args.max_area,
+                                 method=args.method,
+                                 ckpt_seedvr=args.ckpt_seedvr,
+                                 seg_ta_budget=args.seg_ta_budget)
             meta["subset"] = subset
             all_meta.append(meta)
         except Exception as e:
