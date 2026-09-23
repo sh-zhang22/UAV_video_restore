@@ -30,11 +30,12 @@ import torch
 import torch.nn.functional as F
 
 from ._io import read_video_tchw_float
-from .psnr import psnr as psnr_fn
+from .psnr import psnr as psnr_fn, psnr_y as psnr_y_fn
 from .lpips import lpips_metric
 
 
-DEFAULT_PIXEL_METRICS: Tuple[str, ...] = ("psnr", "ssim", "lpips")
+DEFAULT_PIXEL_METRICS: Tuple[str, ...] = ("psnr", "psnr_y", "ssim", "lpips")
+_PIXEL_WHITELIST = {"psnr", "psnr_y", "ssim", "lpips"}
 
 
 def _ssim_batched(pred: torch.Tensor, gt: torch.Tensor,
@@ -83,7 +84,7 @@ class Evaluator:
         self,
         device: str = "cuda:0",
         *,
-        lpips_net: str = "alex",
+        lpips_net: str = "vgg",
         lpips_batch: int = 8,
         ssim_batch: int = 32,
     ):
@@ -100,27 +101,28 @@ class Evaluator:
         cands: Mapping[str, Union[str, Path, torch.Tensor]],
         *,
         which: Sequence[str] = DEFAULT_PIXEL_METRICS,
-        resize_mode: str = "ref",
+        resize_mode: str = "min",
         max_frames: Optional[int] = None,
     ) -> Dict[str, Dict[str, float]]:
-        """算 ref 与每个 cand 的三项像素指标。
+        """算 ref 与每个 cand 的像素指标（psnr / psnr_y / ssim / lpips）。
 
         Params
         ------
         ref, cands
             可以是 mp4 路径（会用 `read_video_tchw_float` 加载）或 (T,3,H,W) [0,1] tensor。
         which
-            指标子集，只能是 pixel 指标（psnr/ssim/lpips）；mIoU 单独接口
+            指标子集，只能是 pixel 指标（psnr/psnr_y/ssim/lpips）；mIoU 单独接口
         resize_mode
-            - "ref": cand resize 到 ref 尺寸（VSR 常用做法）
-            - "min": ref 和 cand 都 resize 到 min(H,W)（少见）
+            - "min": 全部 resize 到 min(H,W)（默认，避免 upscale 引入插值损失，
+                     对生成式 SR 更公平；当 cand 中有下采路时等于降到该 cand 原生分辨率）
+            - "ref": cand resize 到 ref 尺寸（传统 VSR 做法，upscale 会 penalize 生成式方法）
             - None:  严格 shape，不匹配则 raise
 
         帧数不匹配总是取 min(T) 前对齐。
         """
         which = tuple(which)
-        if not set(which).issubset({"psnr", "ssim", "lpips"}):
-            raise ValueError(f"which 只支持 {{psnr, ssim, lpips}}，收到 {which}")
+        if not set(which).issubset(_PIXEL_WHITELIST):
+            raise ValueError(f"which 只支持 {sorted(_PIXEL_WHITELIST)}，收到 {which}")
 
         ref_t = self._as_tensor(ref)
         cand_ts = {name: self._as_tensor(v) for name, v in cands.items()}
@@ -166,7 +168,7 @@ class Evaluator:
         cand_names: Mapping[str, str],
         *,
         which: Sequence[str] = DEFAULT_PIXEL_METRICS,
-        resize_mode: str = "ref",
+        resize_mode: str = "min",
         video_stems: Optional[Iterable[str]] = None,
         out_csv: Optional[str] = "metrics_pixel.csv",
         out_json: Optional[str] = "metrics_pixel.json",
@@ -380,6 +382,8 @@ class Evaluator:
         scores: Dict[str, float] = {}
         if "psnr" in which:
             scores["psnr"] = psnr_fn(cand, ref)
+        if "psnr_y" in which:
+            scores["psnr_y"] = psnr_y_fn(cand, ref)
         if "ssim" in which:
             scores["ssim"] = _ssim_batched(
                 cand, ref, device=self.device, batch=self.ssim_batch,
