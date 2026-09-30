@@ -9,12 +9,13 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -143,3 +144,121 @@ def run_seedvr(
     if not os.path.isfile(recovered_path):
         raise RuntimeError(f"SeedVR 推断结束但未生成输出: {recovered_path}")
     return recovered_path
+
+
+def run_seedvr_batch(
+    *,
+    variant: str,
+    ckpt_path: str,
+    device: Optional[str],
+    manifest: List[Dict[str, Any]],
+    common_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """批推理入口：一次子进程跑 N 个视频，runner 常驻。
+
+    Params
+    ------
+    variant : str
+        SeedVR variant，只支持 baseline (seedvr_3b/7b, seedvr2_3b/7b)。ctrl/ctrlnet/distill
+        走不同 forward path，不在此入口范围内。
+    ckpt_path : str
+        DiT ckpt 绝对路径。
+    device : str | None
+        规范化前的 device 字符串（"cuda:1" / "1,3" / "1"）。
+    manifest : list of dict
+        每项字段 in_video / out_video（必需），res_h / res_w / chunk_frames / seed / out_fps
+        （可覆盖 common_kwargs 里的同名值）；可选 force=True 强制覆盖已存在的 out_video。
+    common_kwargs : dict, optional
+        全局默认参数，同 method_kwargs 语义：sp_size / res_h / res_w / seed / cfg_scale /
+        cfg_rescale / sample_steps / cond_noise_scale / out_fps / chunk_frames / vae_ckpt /
+        torchrun / master_port / nproc_per_node。
+
+    Returns
+    -------
+    dict: {"n_ok": int, "n_err": int, "errors": list, "manifest_path": str}
+    """
+    common_kwargs = dict(common_kwargs or {})
+    if not os.path.isdir(_SEEDVR_ROOT):
+        raise FileNotFoundError(f"未找到 SeedVR 源码: {_SEEDVR_ROOT}")
+    if not manifest:
+        raise ValueError("manifest 为空")
+
+    dit_ckpt = os.path.abspath(ckpt_path)
+    vae_ckpt = common_kwargs.get("vae_ckpt") or os.path.join(
+        os.path.dirname(dit_ckpt), "ema_vae.pth"
+    )
+    vae_ckpt = os.path.abspath(vae_ckpt)
+    if not os.path.isfile(vae_ckpt):
+        raise FileNotFoundError(f"未找到 VAE ckpt: {vae_ckpt}")
+
+    # 把每项路径规范化成绝对路径（子进程 chdir 到 SeedVR 根，相对路径会指错地方）
+    items = []
+    for it in manifest:
+        it = dict(it)
+        it["in_video"] = os.path.abspath(it["in_video"])
+        it["out_video"] = os.path.abspath(it["out_video"])
+        # 为父目录 mkdir，避免子进程 open 出错
+        os.makedirs(os.path.dirname(it["out_video"]), exist_ok=True)
+        items.append(it)
+
+    # 写 manifest 到一个可被子进程读取的临时 JSON（子进程读完不删，方便排错）
+    tmp_dir = tempfile.mkdtemp(prefix="seedvr_batch_")
+    manifest_path = os.path.join(tmp_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(items, f, indent=2, ensure_ascii=False)
+
+    torchrun = common_kwargs.get("torchrun") or _DEFAULT_TORCHRUN
+    if not os.path.isfile(torchrun):
+        torchrun = shutil.which("torchrun") or torchrun
+    master_port = str(common_kwargs.get("master_port", 29501))
+    sp_size = int(common_kwargs.get("sp_size", 1))
+    nproc = int(common_kwargs.get("nproc_per_node", sp_size))
+
+    cmd = [
+        torchrun,
+        f"--nproc-per-node={nproc}",
+        f"--master_port={master_port}",
+        _RUNNER,
+        "--variant", variant,
+        "--seedvr_root", _SEEDVR_ROOT,
+        "--dit_ckpt", dit_ckpt,
+        "--vae_ckpt", vae_ckpt,
+        "--sp_size", str(sp_size),
+        "--batch_manifest", manifest_path,
+        # 全局默认值（每 item 里出现同名字段会覆盖）
+        "--res_h", str(common_kwargs.get("res_h", 720)),
+        "--res_w", str(common_kwargs.get("res_w", 1280)),
+        "--seed", str(common_kwargs.get("seed", 666)),
+        "--cfg_rescale", str(common_kwargs.get("cfg_rescale", 0.0)),
+    ]
+    for opt_key in ("cfg_scale", "sample_steps", "cond_noise_scale", "out_fps",
+                    "chunk_frames"):
+        if common_kwargs.get(opt_key) is not None:
+            cmd += [f"--{opt_key}", str(common_kwargs[opt_key])]
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _SEEDVR_ROOT + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    cvd = _resolve_device(device)
+    if cvd is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cvd
+
+    proc = subprocess.run(cmd, env=env, cwd=_SEEDVR_ROOT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"SeedVR 批处理子进程退出码非零: {proc.returncode}；"
+                           f"manifest={manifest_path}")
+
+    # 统计成功/失败
+    errors_path = manifest_path + ".errors"
+    errors = []
+    if os.path.isfile(errors_path):
+        with open(errors_path) as f:
+            errors = json.load(f)
+    n_ok = sum(1 for it in items if os.path.isfile(it["out_video"]))
+    return {
+        "n_ok": n_ok,
+        "n_err": len(errors),
+        "errors": errors,
+        "manifest_path": manifest_path,
+    }

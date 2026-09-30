@@ -1,4 +1,4 @@
-"""LPIPS：AlexNet backbone，逐帧算跨帧平均。
+"""LPIPS：backbone 由 net 指定（本函数默认 alex，即官方推荐的评测配置；vgg 数值系统性更高，不可混比），逐帧算跨帧平均。
 
 约定输入：pred/gt 都是 (T, C, H, W) float in [0, 1]，通道数必须 3（RGB）。
 LPIPS 内部期望 (-1, 1)，本模块负责归一化。

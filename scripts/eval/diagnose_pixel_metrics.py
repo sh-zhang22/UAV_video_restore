@@ -29,7 +29,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from metrics._io import read_video_tchw_float   # noqa: E402
 from metrics.psnr import psnr as psnr_fn        # noqa: E402
 from metrics.lpips import lpips_metric          # noqa: E402
-from metrics.evaluator import _ssim_batched, _bicubic_resize   # noqa: E402
+from metrics.evaluator import _ssim_batched   # noqa: E402
+
+
+def _bicubic_resize(vid, H, W):
+    """仅供本诊断脚本对比旧 resize 方式；正式评估请用 metrics.SeedVRGeometry。"""
+    if vid.shape[-2:] == (H, W):
+        return vid
+    return F.interpolate(vid, size=(H, W), mode="bicubic", align_corners=False,
+                         antialias=True).clamp_(0.0, 1.0)
 
 
 VD_ROOT = Path("/nas/datasets/yixin/UAV_Dataset/VisDrone2019-VID-slices")

@@ -249,17 +249,12 @@ def _run_one_video(
         seg_len = seg.size(1)
         seg_padded = _cut_videos(seg, sp_size)
 
-        runner.dit.to("cpu")
-        runner.vae.to(get_device())
         cond_latents = runner.vae_encode([seg_padded])
-        runner.vae.to("cpu")
-        runner.dit.to(get_device())
 
         if len(chunk_starts) > 1:
             print(f"[chunk] seg {seg_idx+1}/{len(chunk_starts)}: frames {s0}:{s1} (len={seg_len})")
 
         samples = _generation_step(runner, text_embeds, cond_latents, cond_noise_scale)
-        runner.dit.to("cpu")
         gc.collect(); torch.cuda.empty_cache()
 
         if get_sequence_parallel_rank() != 0:
@@ -412,11 +407,7 @@ def _run_one_video_ctrl(
     mask_ctchw = _cut_videos(mask_ctchw, sp_size)              # (1, T_padded, H_align, W_align)
     mask_tchw_aligned = mask_ctchw.permute(1, 0, 2, 3).contiguous()  # (T_padded, 1, H, W)
 
-    runner.dit.to("cpu")
-    runner.vae.to(get_device())
     cond_latents = runner.vae_encode([cond_latent])
-    runner.vae.to("cpu")
-    runner.dit.to(get_device())
 
     # VAE encode 完成后才知道 latent 时间维；对 mask 做同构（causal 4x 时间 + 8x 空间）下采
     # cond_latents[0] 的 shape 是 (T, H, W, C)：SeedVR VAE 输出经过 "b c ... -> b ... c" 重排 + squeeze(0)
@@ -428,7 +419,6 @@ def _run_one_video_ctrl(
     samples = _generation_step_ctrl(
         runner, text_embeds, cond_latents, cond_noise_scale, mask_latent
     )
-    runner.dit.to("cpu")
 
     if get_sequence_parallel_rank() != 0:
         return
@@ -574,11 +564,7 @@ def _run_one_video_ctrlnet(
     mask_ctchw = _cut_videos(mask_ctchw, sp_size)
     mask_tchw_aligned = mask_ctchw.permute(1, 0, 2, 3).contiguous()
 
-    runner.dit.to("cpu")
-    runner.vae.to(get_device())
     cond_latents = runner.vae_encode([cond_latent])
-    runner.vae.to("cpu")
-    runner.dit.to(get_device())
 
     T_latent = cond_latents[0].shape[0]
     mask_latent = mask_temporal_downsample_causal(
@@ -588,7 +574,6 @@ def _run_one_video_ctrlnet(
     samples = _generation_step_ctrlnet(
         runner, text_embeds, cond_latents, cond_noise_scale, mask_latent
     )
-    runner.dit.to("cpu")
 
     if get_sequence_parallel_rank() != 0:
         return
@@ -616,8 +601,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", required=True, choices=list(VARIANTS.keys()))
     parser.add_argument("--seedvr_root", required=True)
-    parser.add_argument("--in_video", required=True)
-    parser.add_argument("--out_video", required=True)
+    parser.add_argument("--in_video", default=None)
+    parser.add_argument("--out_video", default=None)
     parser.add_argument("--dit_ckpt", required=True)
     parser.add_argument("--vae_ckpt", required=True)
     parser.add_argument("--res_h", type=int, default=720)
@@ -631,6 +616,12 @@ def main():
     parser.add_argument("--out_fps", type=float, default=None)
     parser.add_argument("--chunk_frames", type=int, default=0,
                         help="按帧数分段推理；0=不分段（原行为）。段长会取整到最近的 4k+1")
+    parser.add_argument("--batch_manifest", default=None,
+                        help="批推理模式：JSON 文件路径，内容是 "
+                             "[{\"in_video\":..., \"out_video\":..., "
+                             "\"res_h\":..., \"res_w\":..., \"chunk_frames\":...}, ...]。"
+                             "只对 baseline variant (seedvr_3b/7b, seedvr2_3b/7b) 生效。"
+                             "传了此参数时 --in_video/--out_video 忽略。")
     # seedvr2_3b_ctrl 专用参数（其它 variant 不会传，全部 default=None/False）
     parser.add_argument("--mask_path", default=None)
     parser.add_argument("--lora_ckpt", default=None)
@@ -799,7 +790,67 @@ def main():
                 out_fps=args.out_fps,
                 cond_noise_scale=cond_noise_scale,
             )
+    elif args.batch_manifest:
+        # ---- 分支 D：批推理（baseline variant only：一次子进程跑 N 个视频） ----
+        # 每个 item 可覆盖 res_h/res_w/chunk_frames/seed/out_fps；未覆盖则用 args 默认值
+        import json as _json
+        import traceback as _tb
+        manifest_path = args.batch_manifest
+        with open(manifest_path) as f:
+            items = _json.load(f)
+        if not isinstance(items, list) or not items:
+            raise SystemExit(f"batch_manifest 非法或为空: {manifest_path}")
+        errors_path = manifest_path + ".errors"
+        errors = []
+        n_done = 0
+        for i, item in enumerate(items):
+            in_video = item["in_video"]
+            out_video = item["out_video"]
+            if os.path.isfile(out_video) and not item.get("force", False):
+                print(f"\n[batch {i+1}/{len(items)}] SKIP (exists): {out_video}")
+                n_done += 1
+                continue
+            print(f"\n[batch {i+1}/{len(items)}] {os.path.basename(in_video)} → "
+                  f"{os.path.basename(out_video)}")
+            try:
+                _run_one_video(
+                    runner,
+                    in_video=in_video,
+                    out_video=out_video,
+                    cfg_scale=cfg_scale,
+                    cfg_rescale=args.cfg_rescale,
+                    sample_steps=sample_steps,
+                    seed=int(item.get("seed", args.seed)),
+                    res_h=int(item.get("res_h", args.res_h)),
+                    res_w=int(item.get("res_w", args.res_w)),
+                    sp_size=args.sp_size,
+                    out_fps=item.get("out_fps", args.out_fps),
+                    cond_noise_scale=cond_noise_scale,
+                    chunk_frames=int(item.get("chunk_frames", args.chunk_frames)),
+                )
+                n_done += 1
+                # 释放峰值内存供下一个视频使用；runner 保持活着，模型 stay loaded
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(dev)
+            except Exception as e:
+                err_msg = f"{type(e).__name__}: {e}"
+                print(f"  !! batch item failed: {err_msg}")
+                _tb.print_exc()
+                errors.append({"in_video": in_video, "out_video": out_video,
+                               "error": err_msg})
+                # OOM 后必须清空 cache，否则下一个视频立刻再 OOM
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+        print(f"\n[batch summary] done={n_done}/{len(items)}, errors={len(errors)}")
+        if errors:
+            with open(errors_path, "w") as f:
+                _json.dump(errors, f, indent=2, ensure_ascii=False)
+            print(f"[batch summary] errors written to {errors_path}")
     else:
+        if not args.in_video or not args.out_video:
+            raise SystemExit("非 batch 模式必须传 --in_video 和 --out_video")
         _run_one_video(
             runner,
             in_video=args.in_video,

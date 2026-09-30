@@ -2,17 +2,20 @@
 
 设计目标：
 - 减少视频重复 IO 与 GPU↔CPU 搬运
-- shape 不一致时统一 resize（默认 cand → ref 尺寸，bicubic + antialias）
+- 空间对齐只走 SeedVRGeometry（与 SeedVR 输入端逐位一致的缩放 + 中心裁剪）；
+  对齐后 shape 必须严格一致，否则 raise —— 不做任何隐式 resize
 - PSNR / SSIM / LPIPS 走同一份加载好的 tensor
 - mIoU 分三种输入模式：mask / video (YOLO) / boxes (VisDrone 场景)
 
 用法示例：
-    from metrics import Evaluator
+    from metrics import Evaluator, SeedVRGeometry
     ev = Evaluator(device="cuda:1")
+    geom = SeedVRGeometry.from_max_area(H_orig, W_orig, 720 * 1280)
     res = ev.evaluate(
         ref="orig.mp4",
         cands={"cmp": "compressed.mp4", "rst": "restored.mp4"},
         which=("psnr", "ssim", "lpips"),
+        geometry=geom,          # orig / compressed 走 geom，restored 已在 geom 输出空间
     )
     # {"cmp": {"psnr": 30.9, ...}, "rst": {...}}
 """
@@ -27,9 +30,9 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 
 from ._io import read_video_tchw_float
+from .geometry import DEFAULT_MAX_AREA, SeedVRGeometry
 from .psnr import psnr as psnr_fn, psnr_y as psnr_y_fn
 from .lpips import lpips_metric
 
@@ -57,14 +60,6 @@ def _ssim_batched(pred: torch.Tensor, gt: torch.Tensor,
     return sum(v * c for v, c in zip(vals, counts)) / total
 
 
-def _bicubic_resize(vid: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """(T, C, H0, W0) → (T, C, H, W) bicubic + antialias, clamp [0,1]."""
-    if vid.shape[-2] == H and vid.shape[-1] == W:
-        return vid
-    return F.interpolate(vid, size=(H, W), mode="bicubic",
-                         align_corners=False, antialias=True).clamp_(0.0, 1.0)
-
-
 class Evaluator:
     """一份 ref、多个 cand、可选 mIoU 的统一评测器。
 
@@ -73,7 +68,8 @@ class Evaluator:
     device : str
         SSIM / LPIPS 的 GPU 设备。PSNR 全 CPU。
     lpips_net : str
-        LPIPS backbone，官方默认 "alex"；也支持 "vgg" / "squeeze"。
+        LPIPS backbone，本类默认 "vgg"（官方推荐评测用 "alex"）；也支持 "squeeze"。
+        不同 backbone 数值不可混比。
     lpips_batch : int
         LPIPS 单次前向的帧 batch。默认 8，1080p 单卡够用。
     ssim_batch : int
@@ -101,7 +97,7 @@ class Evaluator:
         cands: Mapping[str, Union[str, Path, torch.Tensor]],
         *,
         which: Sequence[str] = DEFAULT_PIXEL_METRICS,
-        resize_mode: str = "min",
+        geometry: Optional[SeedVRGeometry] = None,
         max_frames: Optional[int] = None,
     ) -> Dict[str, Dict[str, float]]:
         """算 ref 与每个 cand 的像素指标（psnr / psnr_y / ssim / lpips）。
@@ -112,11 +108,9 @@ class Evaluator:
             可以是 mp4 路径（会用 `read_video_tchw_float` 加载）或 (T,3,H,W) [0,1] tensor。
         which
             指标子集，只能是 pixel 指标（psnr/psnr_y/ssim/lpips）；mIoU 单独接口
-        resize_mode
-            - "min": 全部 resize 到 min(H,W)（默认，避免 upscale 引入插值损失，
-                     对生成式 SR 更公平；当 cand 中有下采路时等于降到该 cand 原生分辨率）
-            - "ref": cand resize 到 ref 尺寸（传统 VSR 做法，upscale 会 penalize 生成式方法）
-            - None:  严格 shape，不匹配则 raise
+        geometry
+            给定时，ref 及尺寸等于 geometry.in_size 的 cand 先走 SeedVR 同款缩放 + 中心裁剪
+            （restored 本身已在输出空间，原样使用）。之后所有 shape 必须严格一致，否则 raise。
 
         帧数不匹配总是取 min(T) 前对齐。
         """
@@ -134,26 +128,21 @@ class Evaluator:
         ref_t = ref_t[:T]
         cand_ts = {n: t[:T] for n, t in cand_ts.items()}
 
-        # 尺寸对齐
+        # 空间对齐：只允许 SeedVR 几何，不做任何隐式 resize
+        if geometry is not None:
+            def _align(t):
+                if tuple(t.shape[-2:]) == geometry.in_size:
+                    return geometry.apply_video(t, device=self.device)
+                return t
+            ref_t = _align(ref_t)
+            cand_ts = {n: _align(t) for n, t in cand_ts.items()}
         Href, Wref = ref_t.shape[-2:]
-        if resize_mode == "ref":
-            for n in list(cand_ts):
-                cand_ts[n] = _bicubic_resize(cand_ts[n], Href, Wref)
-        elif resize_mode == "min":
-            Hmin = min([Href] + [t.shape[-2] for t in cand_ts.values()])
-            Wmin = min([Wref] + [t.shape[-1] for t in cand_ts.values()])
-            ref_t = _bicubic_resize(ref_t, Hmin, Wmin)
-            for n in list(cand_ts):
-                cand_ts[n] = _bicubic_resize(cand_ts[n], Hmin, Wmin)
-        elif resize_mode is None:
-            for n, t in cand_ts.items():
-                if t.shape[-2:] != (Href, Wref):
-                    raise ValueError(
-                        f"[Evaluator] resize_mode=None 但 cand {n!r} shape "
-                        f"{tuple(t.shape[-2:])} != ref {(Href, Wref)}"
-                    )
-        else:
-            raise ValueError(f"unknown resize_mode: {resize_mode}")
+        for n, t in cand_ts.items():
+            if t.shape[-2:] != (Href, Wref):
+                raise ValueError(
+                    f"[Evaluator] cand {n!r} shape {tuple(t.shape[-2:])} != ref {(Href, Wref)}"
+                    + ("" if geometry is None else f"（geometry {geometry.in_size}→{geometry.out_size}）")
+                )
 
         # 逐 cand 算指标
         out: Dict[str, Dict[str, float]] = {}
@@ -168,7 +157,7 @@ class Evaluator:
         cand_names: Mapping[str, str],
         *,
         which: Sequence[str] = DEFAULT_PIXEL_METRICS,
-        resize_mode: str = "min",
+        max_area: Optional[int] = DEFAULT_MAX_AREA,
         video_stems: Optional[Iterable[str]] = None,
         out_csv: Optional[str] = "metrics_pixel.csv",
         out_json: Optional[str] = "metrics_pixel.json",
@@ -184,6 +173,8 @@ class Evaluator:
             stem -> Path，返回该 stem 的 ref 视频路径（比如 orig .mp4）
         cand_names
             {"cmp": "compressed.mp4", "rst": "restored.mp4"} —— 逻辑名 → 子目录内文件名
+        max_area
+            生成 restored 时传给 SeedVR 的 --max_area；按 ref 尺寸构造 SeedVRGeometry 对齐
         video_stems
             指定子目录白名单；None 表示扫全部
         out_csv / out_json
@@ -223,11 +214,12 @@ class Evaluator:
             if verbose:
                 print(f"[{i}/{len(dirs)}] {stem}")
 
-            res = self.evaluate(str(ref_p), cands_p, which=which, resize_mode=resize_mode)
-
-            # 展平成一行：video, T, H, W, {name}_{metric}...
             ref_t = self._as_tensor(str(ref_p))
             T, _, H, W = ref_t.shape
+            geom = SeedVRGeometry.from_max_area(H, W, max_area)
+            res = self.evaluate(ref_t, cands_p, which=which, geometry=geom)
+
+            # 展平成一行：video, T, H, W, {name}_{metric}...
             row = {"video": stem, "T": int(T), "H": int(H), "W": int(W)}
             for name, scores in res.items():
                 for k, v in scores.items():

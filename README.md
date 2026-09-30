@@ -483,13 +483,13 @@ RES_H=720 RES_W=960 CUDA_VISIBLE_DEVICES=1 bash run_seedvr2_3b.sh
 |-----------------|-----------|----------|--------|------------------|-----------|
 | PSNR            | 像素      | ✓        | ∞      | 像素级 L2        | CPU 秒级 |
 | SSIM            | 局部结构  | ✓        | 1      | 亮度/对比度/纹理 | GPU 秒级（chunked 防 int32 溢出） |
-| LPIPS           | 学习感知  | ✗        | 0      | 视觉感知差异     | GPU 数秒（首次下 AlexNet 233MB） |
+| LPIPS           | 学习感知  | ✗        | 0      | 视觉感知差异     | GPU 数秒（backbone 默认 vgg，可选 alex） |
 | mIoU (mask)     | 语义分割  | ✓        | 1      | ROI 位置形状     | CPU 秒级 |
 | **mIoU (bbox)** | 目标检测  | ✓        | 1      | 目标级一致性     | CPU 秒级 |
 
 **bbox-mIoU（松弛版，默认）**：每帧对 pred × ref 做 IoU 最大化一对一匹配（greedy/hungarian）；漏检 IoU=0（惩罚）；误检丢弃（不惩罚）；`min_side < 32` 的小目标双向剔除；micro-average。见 `metrics.miou.miou_bbox_match`。
 
-**约束**：cand 与 ref 帧数不一致 → 取 min(T) 前对齐；分辨率不一致 → 默认 `resize_mode="ref"`，cand bicubic+antialias 缩到 ref。
+**约束**：cand 与 ref 帧数不一致 → 取 min(T) 前对齐；空间对齐只走 `metrics.SeedVRGeometry`（与 SeedVR 输入端逐位一致的面积保比 bicubic 缩放 + 16 倍数中心裁剪），orig/compressed 变换到 restored 坐标系后再比；对齐后 shape 不一致直接报错。`evaluate_folder` / `compute_pixel_metrics.py` 的 `max_area` 须与生成 restored 时一致（默认 720×1280）。Y-PSNR 用 BT.601 limited 公式（与解码器一致）。
 
 ### 8.2 Python API
 

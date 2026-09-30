@@ -2,10 +2,10 @@
 以 orig（VisDrone-VID-slices 源视频）为参考，跑 PSNR / Y-PSNR / SSIM / LPIPS。
 
 薄壳脚本：核心逻辑在 metrics.Evaluator.evaluate_folder。
-- 分辨率不一致：默认 resize_mode="min"，全部下采到最小尺寸（避免 upscale 引入插值损失，
-  在我们的 3 路视频场景下等价于对齐到 SeedVR 原生输出分辨率）
+- 空间对齐：orig / compressed 走 SeedVR 输入端同款几何（面积保比 bicubic 缩放 + 16 倍数中心裁剪，
+  metrics.SeedVRGeometry），与 restored 逐像素同坐标；--max_area 须与生成 restored 时一致
 - 帧数不一致：min(T) 对齐（前对齐）
-- LPIPS backbone 默认 vgg（更贴近感官；--lpips_net alex 可切回 alex，快 2-3x）
+- LPIPS backbone 默认 vgg（官方推荐评测用 alex，--lpips_net alex 可切换；两者数值不可混比）
 - 结果：metrics_pixel.csv / metrics_pixel.json 写到 <out>/<tag>/
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from metrics import Evaluator, DEFAULT_PIXEL_METRICS                                # noqa: E402
+from metrics import Evaluator, DEFAULT_PIXEL_METRICS, DEFAULT_MAX_AREA                              # noqa: E402
 from scripts.eval.eval_yolo_visdrone import ROOT as VD_ROOT                         # noqa: E402
 
 
@@ -39,9 +39,8 @@ def main():
     ap.add_argument("--videos", nargs="+", default=None,
                     help="视频 stem 列表；不给则跑该 tag 下全部")
     ap.add_argument("--lpips_net", default="vgg", choices=["alex", "vgg", "squeeze"])
-    ap.add_argument("--resize_mode", default="min", choices=["min", "ref"],
-                    help="min: 下采到 min(H,W)，对生成式 SR 公平（默认）；"
-                         "ref: cand 上采到 ref 尺寸，传统 VSR 做法（会 penalize 生成式方法）")
+    ap.add_argument("--max_area", type=int, default=DEFAULT_MAX_AREA,
+                    help="须与生成 restored 时 eval_compress_restore.py 的 --max_area 一致")
     ap.add_argument("--which", nargs="+", default=list(DEFAULT_PIXEL_METRICS),
                     choices=["psnr", "psnr_y", "ssim", "lpips"],
                     help="指标子集")
@@ -54,7 +53,7 @@ def main():
         raise SystemExit(f"tag dir not found: {tag_dir}")
 
     print(f"[plan] tag={args.tag}  device={args.device}  lpips_net={args.lpips_net}  "
-          f"resize_mode={args.resize_mode}  which={args.which}")
+          f"max_area={args.max_area}  which={args.which}")
 
     ev = Evaluator(device=args.device, lpips_net=args.lpips_net)
     ev.evaluate_folder(
@@ -62,7 +61,7 @@ def main():
         ref_lookup=find_orig_mp4,
         cand_names={"cmp": "compressed.mp4", "rst": "restored.mp4"},
         which=tuple(args.which),
-        resize_mode=args.resize_mode,
+        max_area=args.max_area,
         video_stems=args.videos,
         out_csv=args.out_csv,
         out_json=args.out_json,

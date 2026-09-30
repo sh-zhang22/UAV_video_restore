@@ -2,8 +2,8 @@
 1. self-consistency: ref = cand → PSNR≈inf, SSIM≈1, LPIPS≈0
 2. small noise: cand = ref + 高斯 → PSNR 中等, SSIM 略降, LPIPS >0
 3. multi-cand 复用 ref: 一次调 evaluate 同时算 cmp + rst，与两次单调结果一致
-4. resize_mode='ref': cand 分辨率不同也能算完
-5. evaluate_folder: 扫已有 q22_37 目录 → 与之前老脚本产物数字一致（±1e-3）
+4. geometry: 无 geometry 时 shape 不一致必须 raise；SeedVRGeometry 与 SeedVR 原生 transform 逐位一致
+5. evaluate_folder: 扫 q22_37 的 161 视频 → 与几何对齐后的参考数字一致
 
 用法：
     conda activate seedvr
@@ -21,7 +21,8 @@ import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from metrics import Evaluator                                                     # noqa: E402
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+from metrics import Evaluator, SeedVRGeometry, seedvr_target_res, DEFAULT_MAX_AREA  # noqa: E402
 
 
 def _make_synth_video(T=8, H=64, W=64, seed=0) -> torch.Tensor:
@@ -33,8 +34,7 @@ def _make_synth_video(T=8, H=64, W=64, seed=0) -> torch.Tensor:
 def test_self_consistency(ev: Evaluator):
     print("\n=== 1) self-consistency: ref = cand ===")
     v = _make_synth_video()
-    out = ev.evaluate(v, {"self": v}, which=("psnr", "ssim", "lpips"),
-                      resize_mode="ref")
+    out = ev.evaluate(v, {"self": v}, which=("psnr", "ssim", "lpips"))
     s = out["self"]
     print(f"  psnr={s['psnr']}  ssim={s['ssim']:.6f}  lpips={s['lpips']:.6f}")
     assert s["psnr"] == float("inf") or s["psnr"] > 60, s
@@ -75,25 +75,37 @@ def test_multi_cand_consistency(ev: Evaluator):
     print("  [pass]")
 
 
-def test_resize_mode(ev: Evaluator):
-    """cand 分辨率不同也能算完，且 resize 结果不 raise。"""
-    print("\n=== 4) resize_mode='ref' handles mismatched shape ===")
+def test_geometry(ev: Evaluator):
+    print("\n=== 4) geometry: strict shape + 与 SeedVR 原生 transform 逐位一致 ===")
     ref = _make_synth_video(H=64, W=64, seed=5)
-    cand_small = _make_synth_video(T=8, H=48, W=48, seed=5)
-    out = ev.evaluate(ref, {"small": cand_small}, which=("psnr", "ssim", "lpips"),
-                      resize_mode="ref")
-    s = out["small"]
-    print(f"  psnr={s['psnr']:.2f}  ssim={s['ssim']:.4f}  lpips={s['lpips']:.4f}")
-    assert 0 < s["psnr"] < 100, s
+    try:
+        ev.evaluate(ref, {"small": _make_synth_video(H=48, W=48, seed=5)}, which=("psnr",))
+        raise AssertionError("shape 不一致应当 raise")
+    except ValueError:
+        pass
+
+    sys.path.insert(0, os.path.join(REPO, "third_party", "SeedVR"))
+    from torchvision.transforms import Compose, Lambda
+    from data.image.transforms.divisible_crop import DivisibleCrop
+    from data.image.transforms.na_resize import NaResize
+    for H, W in [(382, 680), (766, 1360), (1080, 1920), (540, 960), (1072, 1904)]:
+        geom = SeedVRGeometry.from_max_area(H, W, DEFAULT_MAX_AREA)
+        rh, rw = seedvr_target_res(H, W, DEFAULT_MAX_AREA)
+        native = Compose([NaResize(resolution=(rh * rw) ** 0.5, mode="area", downsample_only=False),
+                          Lambda(lambda x: torch.clamp(x, 0.0, 1.0)), DivisibleCrop((16, 16))])
+        x = _make_synth_video(T=2, H=H, W=W, seed=H).to(ev.device)
+        diff = (native(x).cpu() - geom.apply_video(x, device=ev.device)).abs().max().item()
+        print(f"  {W}x{H} → {geom.Wc}x{geom.Hc} (top={geom.top}, left={geom.left})  max|diff|={diff:.1e}")
+        assert diff == 0.0, (H, W, diff)
     print("  [pass]")
 
 
 def test_folder_matches_old(ev: Evaluator, tag_dir: str):
-    """跑一次 evaluate_folder，与之前老脚本产物 CSV 数字一致（±5e-3）。
+    """跑一次 evaluate_folder，与几何对齐后的参考数字一致。
 
     只跑最小的那个视频 (uav0000161_00000, 540x960) 图快。
     """
-    print(f"\n=== 5) evaluate_folder vs 老脚本产物 ({tag_dir}) ===")
+    print(f"\n=== 5) evaluate_folder vs 几何对齐参考值 ({tag_dir}) ===")
     from pathlib import Path
     from scripts.eval.compute_pixel_metrics import find_orig_mp4
 
@@ -120,11 +132,11 @@ def test_folder_matches_old(ev: Evaluator, tag_dir: str):
         verbose=False,
     )
     row = summary["per_video"]["test-dev_uav0000161_00000_v_full"]
-    # 对照之前 metrics_pixel.csv 里 161_00000 的数字
+    # 161_00000（960x540 → 960x528，上方裁 6 行）几何对齐后的参考值，LPIPS 为 alex
     expected = {
-        "cmp_psnr": 28.959,  "rst_psnr": 17.8119,
-        "cmp_ssim": 0.8476,  "rst_ssim": 0.4713,
-        "cmp_lpips": 0.1499, "rst_lpips": 0.2665,
+        "cmp_psnr": 28.9548, "rst_psnr": 21.1117,
+        "cmp_ssim": 0.8472,  "rst_ssim": 0.6741,
+        "cmp_lpips": 0.1500,  "rst_lpips": 0.2308,
     }
     print(f"  actual: {row}")
     print(f"  expect: {expected}")
@@ -250,7 +262,7 @@ def main():
                     default="/home/zsh/UAV_video_repair/eval_compress_restore/q22_37",
                     help="老产物目录，用于 folder 一致性测试")
     ap.add_argument("--skip", nargs="+", default=[],
-                    choices=["self", "noise", "multi", "resize", "folder",
+                    choices=["self", "noise", "multi", "geometry", "folder",
                              "boxes", "bbox_id", "bbox_miss", "bbox_small", "bbox_hun"])
     args = ap.parse_args()
 
@@ -263,8 +275,8 @@ def main():
         test_noise_direction(ev)
     if "multi" not in args.skip:
         test_multi_cand_consistency(ev)
-    if "resize" not in args.skip:
-        test_resize_mode(ev)
+    if "geometry" not in args.skip:
+        test_geometry(ev)
     if "folder" not in args.skip:
         test_folder_matches_old(ev, args.tag_dir)
     if "boxes" not in args.skip:

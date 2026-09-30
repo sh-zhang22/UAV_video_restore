@@ -12,17 +12,16 @@ import torch
 from ._registry import register
 
 
-def _rgb_to_y_bt709(x: torch.Tensor) -> torch.Tensor:
-    """(T, 3, H, W) [0,1] RGB → (T, 1, H, W) [0,1] Y (BT.709)。
+def _rgb_to_y(x: torch.Tensor) -> torch.Tensor:
+    """(T, 3, H, W) [0,1] RGB → (T, 1, H, W) Y，BT.601 limited range（Y ∈ [16,235]/255）。
 
-    BT.709 (HD/1080p 标准，与 ffmpeg 默认 colorspace 一致):
-        Y = 0.2126 R + 0.7152 G + 0.0722 B
+    本项目的 mp4 均无色彩标签，解码器按 BT.601 limited 转 RGB，此公式即其逆变换，
+    与码流里的真实 Y 平面一致；同时也是 BasicSR / MATLAB rgb2ycbcr 的 VSR 通用约定。
     """
     if x.shape[1] != 3:
         raise ValueError(f"rgb_to_y 需要 C=3，got shape={tuple(x.shape)}")
-    w = torch.tensor([0.2126, 0.7152, 0.0722], dtype=x.dtype, device=x.device)
-    y = (x * w.view(1, 3, 1, 1)).sum(dim=1, keepdim=True)
-    return y.clamp_(0.0, 1.0)
+    w = torch.tensor([65.481, 128.553, 24.966], dtype=x.dtype, device=x.device) / 255.0
+    return (x * w.view(1, 3, 1, 1)).sum(dim=1, keepdim=True) + 16.0 / 255.0
 
 
 @register("psnr")
@@ -45,11 +44,10 @@ def psnr(pred: torch.Tensor, gt: torch.Tensor, data_range: float = 1.0) -> float
 
 @register("psnr_y")
 def psnr_y(pred: torch.Tensor, gt: torch.Tensor, data_range: float = 1.0) -> float:
-    """Y-PSNR (BT.709)：视频压缩生态标准指标，只算亮度通道。
+    """Y-PSNR：只算亮度通道（BT.601 limited，见 _rgb_to_y），data_range 仍取 1.0（VSR 惯例）。
 
-    人眼对亮度远比色度敏感，Y-PSNR 与主观质量相关性显著高于 RGB-PSNR。
     输入约定与 psnr() 一致：(T, 3, H, W) [0,1] RGB。
     """
     if pred.shape != gt.shape:
         raise ValueError(f"psnr_y shape mismatch: {tuple(pred.shape)} vs {tuple(gt.shape)}")
-    return psnr(_rgb_to_y_bt709(pred), _rgb_to_y_bt709(gt), data_range=data_range)
+    return psnr(_rgb_to_y(pred), _rgb_to_y(gt), data_range=data_range)
